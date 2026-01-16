@@ -1,8 +1,8 @@
 Flask==3.0.0
 Werkzeug==3.0.1
-torch==2.1.2
-torchvision==0.16.2
+torch
+torchvision
 Pillow==10.2.0
 gunicorn==21.2.0
-numpy==1.26.3
-opencv-python-headless==4.9.0.80
+numpy
+opencv-python-headless
