@@ -7,7 +7,7 @@ import cv2
 import torch
 import torch.nn as nn
 from torchvision import models, transforms
-from PIL import Image
+from PIL import Image, ImageStat  # Added ImageStat for brightness/variance check
 from flask import Flask, request, jsonify
 from werkzeug.utils import secure_filename
 
@@ -18,10 +18,43 @@ UPLOAD_FOLDER = '/tmp'
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
 MODEL_PATH = 'models/mammo_model.pth'
 
+# --- SECURITY THRESHOLDS (NEW) ---
+CONFIDENCE_THRESHOLD = 0.60  # Reject if model is less than 60% sure
+MIN_VARIANCE = 50            # Reject if image has no detail (solid color)
+
 # Global Model Variable
 loaded_model = None
 # We will auto-detect these
 detected_classes = ['Benign', 'Malignant'] 
+
+# --- IMAGE VALIDATION FUNCTION (NEW) ---
+def is_valid_medical_image(image_pil):
+    """
+    Checks if image looks valid (not blank, not too dark/bright, has detail).
+    Returns (True, None) or (False, "Error Reason").
+    """
+    try:
+        # 1. Convert to grayscale for analysis
+        gray = image_pil.convert('L')
+        stat = ImageStat.Stat(gray)
+        
+        # Check Brightness (Mean pixel value 0-255)
+        mean_brightness = stat.mean[0]
+        if mean_brightness < 5:
+            return False, "Image is too dark (black screen)."
+        if mean_brightness > 250:
+            return False, "Image is too bright (white screen)."
+
+        # Check Variance (Detail level)
+        # Medical scans have high contrast/variance. Solid colors have 0 variance.
+        variance = stat.var[0]
+        if variance < MIN_VARIANCE:
+            return False, "Image is blank or has no detail."
+
+        return True, None
+    except Exception as e:
+        print(f"Validation Error: {e}")
+        return True, None # If check fails, let it pass rather than crash
 
 def load_pytorch_model():
     global loaded_model, detected_classes
@@ -39,50 +72,28 @@ def load_pytorch_model():
         checkpoint = torch.load(MODEL_PATH, map_location=device, weights_only=False)
         print(f" * [INFO] File loaded. Type: {type(checkpoint)}")
         
-        # Debug: Print keys if it's a dict
-        if isinstance(checkpoint, dict):
-            print(f" * [DEBUG] Dictionary keys: {list(checkpoint.keys())[:10]}")  # Show first 10 keys
-        
         # Extract state_dict from various possible formats
         state_dict = None
         
         if isinstance(checkpoint, dict):
             # Check common checkpoint formats
             if 'model_state_dict' in checkpoint:
-                print(" * [INFO] Found 'model_state_dict' key")
                 state_dict = checkpoint['model_state_dict']
             elif 'state_dict' in checkpoint:
-                print(" * [INFO] Found 'state_dict' key")
                 state_dict = checkpoint['state_dict']
             elif 'model' in checkpoint:
-                print(" * [INFO] Found 'model' key")
                 state_dict = checkpoint['model']
             else:
-                # Check if it looks like a raw state_dict (has layer names)
-                first_key = next(iter(checkpoint.keys()))
-                if any(x in first_key for x in ['conv', 'fc', 'bn', 'layer', 'features']):
-                    print(" * [INFO] Appears to be raw state_dict")
-                    state_dict = checkpoint
-                else:
-                    print(f" ! [WARNING] Unrecognized format. First key: {first_key}")
-                    state_dict = checkpoint
+                state_dict = checkpoint # Assume raw state dict
         elif isinstance(checkpoint, nn.Module):
-            # It's already a model
             print(" * [INFO] Loaded object is already a model!")
             loaded_model = checkpoint
             loaded_model.eval()
-            print(" * [SUCCESS] Model loaded directly.")
             return
-        else:
-            print(f" ! [ERROR] Unexpected type: {type(checkpoint)}")
-            return
-
+        
         if state_dict is None:
-            print(" ! [ERROR] Could not extract state_dict from checkpoint")
+            print(" ! [ERROR] Could not extract state_dict")
             return
-
-        print(f" * [INFO] State dict has {len(state_dict)} keys")
-        print(f" * [INFO] First few keys: {list(state_dict.keys())[:3]}")
 
         # 2. Define the Combinations to Try
         combinations = [
@@ -104,44 +115,30 @@ def load_pytorch_model():
                 num_ftrs = temp_model.fc.in_features
                 temp_model.fc = nn.Linear(num_ftrs, num_classes)
                 
-                print(f"(model created)...", end=" ")
-                
                 # Try to load the state dict
                 missing_keys, unexpected_keys = temp_model.load_state_dict(state_dict, strict=False)
                 
-                print(f"(loaded)...", end=" ")
-                
                 # Check if loading was successful
                 if len(unexpected_keys) > 10:  # Too many unexpected keys
-                    print(f"SKIP (too many unexpected keys: {len(unexpected_keys)})")
+                    print(f"SKIP (too many unexpected keys)")
                     continue
                 
                 # Success! Set model to eval mode
                 temp_model.eval()
-                print("✅ SUCCESS!")
+                print("✅ MATCHED!")
                 
                 loaded_model = temp_model
                 detected_classes = class_names
-                
-                if missing_keys:
-                    print(f"   [INFO] Missing keys: {len(missing_keys)}")
-                if unexpected_keys:
-                    print(f"   [INFO] Unexpected keys: {len(unexpected_keys)}")
-                
                 print(f" * [SUCCESS] Model loaded as {name} ({num_classes} classes).")
                 return
                 
             except Exception as e:
-                print(f"❌ Error: {str(e)[:100]}")
                 continue
 
         print(" ! CRITICAL ERROR: None of the standard architectures matched.")
-        print(" ! Please check if you used VGG, DenseNet, or a custom model.")
         
     except Exception as e:
         print(f" ! FATAL ERROR: {e}")
-        import traceback
-        traceback.print_exc()
 
 # Load on startup
 load_pytorch_model()
@@ -223,18 +220,44 @@ def predict():
             filepath = os.path.join(UPLOAD_FOLDER, filename)
             file.save(filepath)
 
+            # 1. Load Image
             image_pil = Image.open(filepath).convert('RGB')
+
+            # --- NEW CHECK: IS THIS A VALID IMAGE? ---
+            is_valid, error_msg = is_valid_medical_image(image_pil)
+            if not is_valid:
+                print(f"Rejected image: {error_msg}")
+                if os.path.exists(filepath): os.remove(filepath)
+                # Return 'Error' result so app handles it gracefully
+                return jsonify({
+                    'result': 'Error',
+                    'confidence': '0%',
+                    'error': error_msg
+                })
+
+            # 2. Preprocess
             input_tensor = transform(image_pil).unsqueeze(0).to('cpu')
 
+            # 3. Predict
             with torch.no_grad():
                 output = loaded_model(input_tensor)
                 probs = torch.nn.functional.softmax(output, dim=1)
                 confidence, predicted_idx = torch.max(probs, 1)
 
-            # Dynamic Class Mapping
+            # 4. Process Results
             idx = predicted_idx.item()
             result_text = detected_classes[idx] if idx < len(detected_classes) else "Unknown"
             conf_score = confidence.item()
+
+            # --- NEW CHECK: CONFIDENCE THRESHOLD ---
+            if conf_score < CONFIDENCE_THRESHOLD:
+                print(f"Rejected low confidence: {conf_score:.2f}")
+                if os.path.exists(filepath): os.remove(filepath)
+                return jsonify({
+                    'result': 'Uncertain',
+                    'confidence': f"{conf_score * 100:.1f}%",
+                    'error': 'Image unclear or not a medical scan.'
+                })
 
             response_data = {
                 'result': result_text,
@@ -242,6 +265,7 @@ def predict():
                 'heatmap': None
             }
 
+            # 5. Doctor Mode (Heatmap)
             if user_mode == 'doctor':
                 try:
                     target_layer = None
@@ -253,8 +277,9 @@ def predict():
                     if target_layer:
                         grad_cam = GradCAM(loaded_model, target_layer)
                         heatmap = grad_cam(input_tensor)
-                        heatmap_b64 = overlay_heatmap(filepath, heatmap)
-                        response_data['heatmap'] = heatmap_b64
+                        if heatmap is not None:
+                            heatmap_b64 = overlay_heatmap(filepath, heatmap)
+                            response_data['heatmap'] = heatmap_b64
                 except Exception as e:
                     print(f"GradCAM Error: {e}")
 
