@@ -35,8 +35,25 @@ def load_pytorch_model():
 
     try:
         # 1. Load the File (The "Key")
-        state_dict = torch.load(MODEL_PATH, map_location=device, weights_only=False)
+        checkpoint = torch.load(MODEL_PATH, map_location=device, weights_only=False)
         print(" * [INFO] File loaded successfully. Now finding the right lock...")
+
+        # Check if it's a state_dict or a full checkpoint
+        if isinstance(checkpoint, dict):
+            # It might have keys like 'model_state_dict', 'state_dict', or be the raw state_dict
+            if 'model_state_dict' in checkpoint:
+                state_dict = checkpoint['model_state_dict']
+            elif 'state_dict' in checkpoint:
+                state_dict = checkpoint['state_dict']
+            else:
+                # Assume it's the raw state_dict
+                state_dict = checkpoint
+        else:
+            # If it's a model object directly (unlikely but possible)
+            loaded_model = checkpoint
+            loaded_model.eval()
+            print(" * [SUCCESS] Model loaded directly as saved model object.")
+            return
 
         # 2. Define the Combinations to Try
         # (Architecture Name, Function, Number of Classes, Class List)
@@ -56,18 +73,18 @@ def load_pytorch_model():
                 temp_model.fc = nn.Linear(num_ftrs, num_classes)
                 
                 # Try to insert the key
-                temp_model.load_state_dict(state_dict)
+                temp_model.load_state_dict(state_dict, strict=False)
                 
                 # IF WE REACH HERE, IT WORKED!
                 print(" MATCHED! ✅")
                 loaded_model = temp_model
-                loaded_model.eval()
+                loaded_model.eval()  # NOW it's safe to call .eval()
                 detected_classes = class_names
                 print(f" * [SUCCESS] Model loaded as {name} ({num_classes} classes).")
                 return # Exit function, we are done
                 
             except Exception as e:
-                print(" Failed. ❌")
+                print(f" Failed. ❌ ({str(e)[:50]})")
                 # Continue to next loop
 
         print(" ! CRITICAL ERROR: None of the standard architectures matched.")
@@ -75,6 +92,8 @@ def load_pytorch_model():
         
     except Exception as e:
         print(f" ! FATAL ERROR loading file: {e}")
+        import traceback
+        traceback.print_exc()
 
 # Load on startup
 load_pytorch_model()
