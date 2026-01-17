@@ -34,64 +34,112 @@ def load_pytorch_model():
     device = torch.device('cpu') 
 
     try:
-        # 1. Load the File (The "Key")
+        # 1. Load the File
+        print(f" * [INFO] Loading file from {MODEL_PATH}...")
         checkpoint = torch.load(MODEL_PATH, map_location=device, weights_only=False)
-        print(" * [INFO] File loaded successfully. Now finding the right lock...")
-
-        # Check if it's a state_dict or a full checkpoint
+        print(f" * [INFO] File loaded. Type: {type(checkpoint)}")
+        
+        # Debug: Print keys if it's a dict
         if isinstance(checkpoint, dict):
-            # It might have keys like 'model_state_dict', 'state_dict', or be the raw state_dict
+            print(f" * [DEBUG] Dictionary keys: {list(checkpoint.keys())[:10]}")  # Show first 10 keys
+        
+        # Extract state_dict from various possible formats
+        state_dict = None
+        
+        if isinstance(checkpoint, dict):
+            # Check common checkpoint formats
             if 'model_state_dict' in checkpoint:
+                print(" * [INFO] Found 'model_state_dict' key")
                 state_dict = checkpoint['model_state_dict']
             elif 'state_dict' in checkpoint:
+                print(" * [INFO] Found 'state_dict' key")
                 state_dict = checkpoint['state_dict']
+            elif 'model' in checkpoint:
+                print(" * [INFO] Found 'model' key")
+                state_dict = checkpoint['model']
             else:
-                # Assume it's the raw state_dict
-                state_dict = checkpoint
-        else:
-            # If it's a model object directly (unlikely but possible)
+                # Check if it looks like a raw state_dict (has layer names)
+                first_key = next(iter(checkpoint.keys()))
+                if any(x in first_key for x in ['conv', 'fc', 'bn', 'layer', 'features']):
+                    print(" * [INFO] Appears to be raw state_dict")
+                    state_dict = checkpoint
+                else:
+                    print(f" ! [WARNING] Unrecognized format. First key: {first_key}")
+                    state_dict = checkpoint
+        elif isinstance(checkpoint, nn.Module):
+            # It's already a model
+            print(" * [INFO] Loaded object is already a model!")
             loaded_model = checkpoint
             loaded_model.eval()
-            print(" * [SUCCESS] Model loaded directly as saved model object.")
+            print(" * [SUCCESS] Model loaded directly.")
+            return
+        else:
+            print(f" ! [ERROR] Unexpected type: {type(checkpoint)}")
             return
 
+        if state_dict is None:
+            print(" ! [ERROR] Could not extract state_dict from checkpoint")
+            return
+
+        print(f" * [INFO] State dict has {len(state_dict)} keys")
+        print(f" * [INFO] First few keys: {list(state_dict.keys())[:3]}")
+
         # 2. Define the Combinations to Try
-        # (Architecture Name, Function, Number of Classes, Class List)
         combinations = [
             ("ResNet50", models.resnet50, 3, ['Benign', 'Malignant', 'Normal']),
             ("ResNet50", models.resnet50, 2, ['Benign', 'Malignant']),
             ("ResNet18", models.resnet18, 3, ['Benign', 'Malignant', 'Normal']),
-            ("ResNet18", models.resnet18, 2, ['Benign', 'Malignant'])
+            ("ResNet18", models.resnet18, 2, ['Benign', 'Malignant']),
+            ("ResNet34", models.resnet34, 3, ['Benign', 'Malignant', 'Normal']),
+            ("ResNet34", models.resnet34, 2, ['Benign', 'Malignant']),
         ]
 
         # 3. Try Each Combination
         for name, model_func, num_classes, class_names in combinations:
             try:
-                print(f"   - Trying {name} with {num_classes} classes...", end="")
+                print(f"   - Trying {name} with {num_classes} classes...", end=" ")
+                
+                # Create model architecture
                 temp_model = model_func(weights=None)
                 num_ftrs = temp_model.fc.in_features
                 temp_model.fc = nn.Linear(num_ftrs, num_classes)
                 
-                # Try to insert the key
-                temp_model.load_state_dict(state_dict, strict=False)
+                print(f"(model created)...", end=" ")
                 
-                # IF WE REACH HERE, IT WORKED!
-                print(" MATCHED! ✅")
+                # Try to load the state dict
+                missing_keys, unexpected_keys = temp_model.load_state_dict(state_dict, strict=False)
+                
+                print(f"(loaded)...", end=" ")
+                
+                # Check if loading was successful
+                if len(unexpected_keys) > 10:  # Too many unexpected keys
+                    print(f"SKIP (too many unexpected keys: {len(unexpected_keys)})")
+                    continue
+                
+                # Success! Set model to eval mode
+                temp_model.eval()
+                print("✅ SUCCESS!")
+                
                 loaded_model = temp_model
-                loaded_model.eval()  # NOW it's safe to call .eval()
                 detected_classes = class_names
+                
+                if missing_keys:
+                    print(f"   [INFO] Missing keys: {len(missing_keys)}")
+                if unexpected_keys:
+                    print(f"   [INFO] Unexpected keys: {len(unexpected_keys)}")
+                
                 print(f" * [SUCCESS] Model loaded as {name} ({num_classes} classes).")
-                return # Exit function, we are done
+                return
                 
             except Exception as e:
-                print(f" Failed. ❌ ({str(e)[:50]})")
-                # Continue to next loop
+                print(f"❌ Error: {str(e)[:100]}")
+                continue
 
         print(" ! CRITICAL ERROR: None of the standard architectures matched.")
         print(" ! Please check if you used VGG, DenseNet, or a custom model.")
         
     except Exception as e:
-        print(f" ! FATAL ERROR loading file: {e}")
+        print(f" ! FATAL ERROR: {e}")
         import traceback
         traceback.print_exc()
 
@@ -114,10 +162,13 @@ class GradCAM:
         self.activations = None
         target_layer.register_forward_hook(self.save_activation)
         target_layer.register_full_backward_hook(self.save_gradient)
+    
     def save_activation(self, module, input, output):
         self.activations = output
+    
     def save_gradient(self, module, grad_input, grad_output):
         self.gradients = grad_output[0]
+    
     def __call__(self, x):
         self.gradients = None
         self.activations = None
@@ -159,6 +210,7 @@ def home():
 def predict():
     if 'file' not in request.files:
         return jsonify({'error': 'No file part'}), 400
+    
     file = request.files['file']
     user_mode = request.form.get('mode', 'patient')
 
@@ -206,10 +258,15 @@ def predict():
                 except Exception as e:
                     print(f"GradCAM Error: {e}")
 
-            if os.path.exists(filepath): os.remove(filepath)
+            if os.path.exists(filepath):
+                os.remove(filepath)
+            
             return jsonify(response_data)
 
         except Exception as e:
+            print(f"Prediction Error: {e}")
+            import traceback
+            traceback.print_exc()
             return jsonify({'error': str(e)}), 500
 
     return jsonify({'error': 'File type not allowed'}), 400
