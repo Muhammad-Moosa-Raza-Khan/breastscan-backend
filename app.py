@@ -16,56 +16,65 @@ app = Flask(__name__)
 # --- CONFIGURATION ---
 UPLOAD_FOLDER = '/tmp'
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
-
-# --- MODEL SETTINGS ---
 MODEL_PATH = 'models/mammo_model.pth'
-loaded_model = None
 
-# *** IMPORTANT: CLASS MAPPING ***
-# PyTorch ImageFolder usually sorts classes Alphabetically.
-# 0 = Benign, 1 = Malignant, 2 = Normal
-CLASS_NAMES = ['Benign', 'Malignant', 'Normal'] 
+# Global Model Variable
+loaded_model = None
+# We will auto-detect these
+detected_classes = ['Benign', 'Malignant'] 
 
 def load_pytorch_model():
-    global loaded_model
-    print(" * Loading PyTorch Model...")
+    global loaded_model, detected_classes
+    print(" * [STARTUP] Loading PyTorch Model...")
 
     if not os.path.exists(MODEL_PATH):
         print(f" ! ERROR: Model not found at {MODEL_PATH}")
         return
 
-    device = torch.device('cpu') # Cloud runs on CPU
+    device = torch.device('cpu') 
 
-    # --- STRATEGY 1: Try loading as a Dictionary (Most Common) ---
     try:
-        print(" * [TRYING] Strategy 1: Loading as State Dictionary...")
-        # Initialize Skeleton (ResNet50)
-        loaded_model = models.resnet50(weights=None) 
-        
-        # --- CRITICAL FIX: Set to 3 Classes (Benign, Malignant, Normal) ---
-        num_ftrs = loaded_model.fc.in_features
-        loaded_model.fc = nn.Linear(num_ftrs, 3) 
-
-        # Load Weights (With Security Fix)
+        # 1. Load the File (The "Key")
         state_dict = torch.load(MODEL_PATH, map_location=device, weights_only=False)
-        loaded_model.load_state_dict(state_dict)
-        print(" * [SUCCESS] Loaded state_dict into ResNet50 (3 Classes).")
+        print(" * [INFO] File loaded successfully. Now finding the right lock...")
 
-    except Exception as e_state:
-        print(f" * Strategy 1 failed ({e_state}). Trying Strategy 2...")
+        # 2. Define the Combinations to Try
+        # (Architecture Name, Function, Number of Classes, Class List)
+        combinations = [
+            ("ResNet50", models.resnet50, 3, ['Benign', 'Malignant', 'Normal']),
+            ("ResNet50", models.resnet50, 2, ['Benign', 'Malignant']),
+            ("ResNet18", models.resnet18, 3, ['Benign', 'Malignant', 'Normal']),
+            ("ResNet18", models.resnet18, 2, ['Benign', 'Malignant'])
+        ]
 
-        # --- STRATEGY 2: Try loading as a Full Model (Backup) ---
-        try:
-            print(" * [TRYING] Strategy 2: Loading as Full Model...")
-            loaded_model = torch.load(MODEL_PATH, map_location=device, weights_only=False)
-            print(" * [SUCCESS] Loaded full model object.")
+        # 3. Try Each Combination
+        for name, model_func, num_classes, class_names in combinations:
+            try:
+                print(f"   - Trying {name} with {num_classes} classes...", end="")
+                temp_model = model_func(weights=None)
+                num_ftrs = temp_model.fc.in_features
+                temp_model.fc = nn.Linear(num_ftrs, num_classes)
+                
+                # Try to insert the key
+                temp_model.load_state_dict(state_dict)
+                
+                # IF WE REACH HERE, IT WORKED!
+                print(" MATCHED! ✅")
+                loaded_model = temp_model
+                loaded_model.eval()
+                detected_classes = class_names
+                print(f" * [SUCCESS] Model loaded as {name} ({num_classes} classes).")
+                return # Exit function, we are done
+                
+            except Exception as e:
+                print(" Failed. ❌")
+                # Continue to next loop
 
-        except Exception as e_full:
-            print(f" ! CRITICAL ERROR: Could not load model. {e_full}")
-            loaded_model = None
-
-    if loaded_model:
-        loaded_model.eval() # Set to evaluation mode
+        print(" ! CRITICAL ERROR: None of the standard architectures matched.")
+        print(" ! Please check if you used VGG, DenseNet, or a custom model.")
+        
+    except Exception as e:
+        print(f" ! FATAL ERROR loading file: {e}")
 
 # Load on startup
 load_pytorch_model()
@@ -86,13 +95,10 @@ class GradCAM:
         self.activations = None
         target_layer.register_forward_hook(self.save_activation)
         target_layer.register_full_backward_hook(self.save_gradient)
-
     def save_activation(self, module, input, output):
         self.activations = output
-
     def save_gradient(self, module, grad_input, grad_output):
         self.gradients = grad_output[0]
-
     def __call__(self, x):
         self.gradients = None
         self.activations = None
@@ -125,7 +131,10 @@ def overlay_heatmap(img_path, heatmap):
 
 @app.route('/', methods=['GET'])
 def home():
-    return "BreastScan PyTorch Server (3-Class) is Running!", 200
+    if loaded_model:
+        return f"BreastScan Server Running! Detected: {len(detected_classes)} Classes", 200
+    else:
+        return "Server Running (NO MODEL LOADED - Check Logs)", 500
 
 @app.route('/predict', methods=['POST'])
 def predict():
@@ -135,7 +144,7 @@ def predict():
     user_mode = request.form.get('mode', 'patient')
 
     if loaded_model is None:
-        return jsonify({'error': 'Model failed to load.'}), 503
+        return jsonify({'error': 'Model failed to load. Check server logs.'}), 503
 
     if file:
         try:
@@ -143,19 +152,17 @@ def predict():
             filepath = os.path.join(UPLOAD_FOLDER, filename)
             file.save(filepath)
 
-            # 1. Preprocess
             image_pil = Image.open(filepath).convert('RGB')
             input_tensor = transform(image_pil).unsqueeze(0).to('cpu')
 
-            # 2. Predict (Handles 3 Classes Now)
             with torch.no_grad():
                 output = loaded_model(input_tensor)
                 probs = torch.nn.functional.softmax(output, dim=1)
                 confidence, predicted_idx = torch.max(probs, 1)
 
-            # Get Class Name (Benign, Malignant, or Normal)
+            # Dynamic Class Mapping
             idx = predicted_idx.item()
-            result_text = CLASS_NAMES[idx] if idx < len(CLASS_NAMES) else "Unknown"
+            result_text = detected_classes[idx] if idx < len(detected_classes) else "Unknown"
             conf_score = confidence.item()
 
             response_data = {
@@ -164,13 +171,12 @@ def predict():
                 'heatmap': None
             }
 
-            # 3. Doctor Mode Logic (Adds Heatmap)
             if user_mode == 'doctor':
                 try:
                     target_layer = None
-                    if hasattr(loaded_model, 'layer4'): # ResNet
+                    if hasattr(loaded_model, 'layer4'): 
                         target_layer = loaded_model.layer4[-1].conv2
-                    elif hasattr(loaded_model, 'features'): # VGG
+                    elif hasattr(loaded_model, 'features'):
                         target_layer = loaded_model.features[-1]
                     
                     if target_layer:
