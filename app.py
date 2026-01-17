@@ -11,34 +11,30 @@ from PIL import Image, ImageStat
 from flask import Flask, request, jsonify
 from werkzeug.utils import secure_filename
 
-# --- 1. DEFINE APP ---
+# --- 1. INITIALIZE APP ---
 app = Flask(__name__)
-application = app  # CRITICAL: Fixes the AWS "AppImportError"
+# CRITICAL FIX: AWS looks for 'application', this ensures it finds it.
+application = app 
 
 # --- 2. CONFIGURATION ---
 UPLOAD_FOLDER = '/tmp'
 MODEL_PATH = 'models/mammo_model.pth'
-
-# --- 3. SECURITY THRESHOLDS ---
 CONFIDENCE_THRESHOLD = 0.60
 MIN_VARIANCE = 50
-
-# Global Vars
 loaded_model = None
 detected_classes = ['Benign', 'Malignant']
 
-# --- 4. IMAGE VALIDATION ---
-def is_valid_medical_image(image_pil):
-    try:
-        gray = image_pil.convert('L')
-        stat = ImageStat.Stat(gray)
-        if stat.mean[0] < 5: return False, "Image too dark"
-        if stat.mean[0] > 250: return False, "Image too bright"
-        if stat.var[0] < MIN_VARIANCE: return False, "Image blank/solid"
-        return True, None
-    except: return True, None
+# --- 3. HELPER: REMOVE 'module.' PREFIX (DataParallel) ---
+def fix_key_names(state_dict):
+    new_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith('module.'):
+            new_dict[k[7:]] = v
+        else:
+            new_dict[k] = v
+    return new_dict
 
-# --- 5. THE WORKING LOADER (Reverted to the Successful Logic) ---
+# --- 4. THE SMART LOADER (Extracts & Adapts) ---
 def load_pytorch_model():
     global loaded_model, detected_classes
     print(f" * [STARTUP] Loading model from {MODEL_PATH}...")
@@ -50,42 +46,78 @@ def load_pytorch_model():
     device = torch.device('cpu')
 
     try:
-        # SIMPLE LOAD: Just grab the data directly (This worked before!)
-        state_dict = torch.load(MODEL_PATH, map_location=device, weights_only=False)
-        print(" * [INFO] File loaded. Testing architectures...")
+        # A. LOAD FILE
+        checkpoint = torch.load(MODEL_PATH, map_location=device, weights_only=False)
+        print(f" * [INFO] File content type: {type(checkpoint)}")
 
-        # Combinations to try
+        # B. EXTRACT STATE DICT (The "Smart" Part)
+        state_dict = None
+        if isinstance(checkpoint, dict):
+            # Check for common wrapper keys
+            if 'model_state_dict' in checkpoint:
+                print(" * [INFO] Found 'model_state_dict' key.")
+                state_dict = checkpoint['model_state_dict']
+            elif 'state_dict' in checkpoint:
+                print(" * [INFO] Found 'state_dict' key.")
+                state_dict = checkpoint['state_dict']
+            elif 'model' in checkpoint:
+                state_dict = checkpoint['model']
+            else:
+                # Assume the whole dict is the weights
+                state_dict = checkpoint
+        elif isinstance(checkpoint, nn.Module):
+            # It's a full model object
+            loaded_model = checkpoint
+            loaded_model.eval()
+            print(" * [SUCCESS] Loaded full model object directly!")
+            return
+
+        if state_dict is None:
+            print(" ! [ERROR] Could not extract weights from file.")
+            return
+
+        # Fix 'module.' keys if they exist
+        state_dict = fix_key_names(state_dict)
+
+        # C. TRY ARCHITECTURES (The "Brute Force" Part)
         combinations = [
             ("ResNet50", models.resnet50, 3, ['Benign', 'Malignant', 'Normal']),
             ("ResNet50", models.resnet50, 2, ['Benign', 'Malignant']),
             ("ResNet18", models.resnet18, 3, ['Benign', 'Malignant', 'Normal']),
             ("ResNet18", models.resnet18, 2, ['Benign', 'Malignant']),
+            ("ResNet34", models.resnet34, 3, ['Benign', 'Malignant', 'Normal']),
+            ("ResNet34", models.resnet34, 2, ['Benign', 'Malignant']),
         ]
 
         for name, model_func, num_classes, class_names in combinations:
+            print(f"   - Testing: {name} ({num_classes} classes)...", end=" ")
             try:
-                print(f"   - Trying {name} ({num_classes} classes)...", end=" ")
-                
                 # 1. Create Skeleton
                 temp_model = model_func(weights=None)
                 num_ftrs = temp_model.fc.in_features
                 temp_model.fc = nn.Linear(num_ftrs, num_classes)
 
-                # 2. Try to Lock the Key (Strict Match)
-                # We use strict=True because your logs showed it matched perfectly before!
-                temp_model.load_state_dict(state_dict)
-                
-                # If we get here, it worked!
-                print("MATCHED! ✅")
-                loaded_model = temp_model
-                loaded_model.eval()
-                detected_classes = class_names
-                print(f" * [SUCCESS] Server Ready. Mode: {name}")
-                return
+                # 2. Try Strict Load
+                try:
+                    temp_model.load_state_dict(state_dict, strict=True)
+                    print("MATCHED! (Strict) ✅")
+                    loaded_model = temp_model
+                    detected_classes = class_names
+                    loaded_model.eval()
+                    return
+                except Exception as e_strict:
+                    # 3. If Strict fails, try Non-Strict (Partial Match)
+                    temp_model.load_state_dict(state_dict, strict=False)
+                    print("MATCHED! (Loose) ⚠️")
+                    loaded_model = temp_model
+                    detected_classes = class_names
+                    loaded_model.eval()
+                    return
 
-            except Exception:
-                print("❌")
-                continue # Try next one
+            except Exception as e:
+                # Print the ACTUAL error to help debug
+                print(f"❌ {str(e)[:50]}...") # Show first 50 chars of error
+                continue
 
         print(" ! [CRITICAL] No matching architecture found.")
 
@@ -94,6 +126,17 @@ def load_pytorch_model():
 
 load_pytorch_model()
 
+# --- 5. IMAGE VALIDATION ---
+def is_valid_medical_image(image_pil):
+    try:
+        gray = image_pil.convert('L')
+        stat = ImageStat.Stat(gray)
+        if stat.mean[0] < 5: return False, "Image too dark"
+        if stat.mean[0] > 250: return False, "Image too bright"
+        if stat.var[0] < MIN_VARIANCE: return False, "Image blank/solid"
+        return True, None
+    except: return True, None
+
 # --- 6. PREPROCESSING ---
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
@@ -101,13 +144,12 @@ transform = transforms.Compose([
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
 
-# --- 7. GRAD-CAM (Doctor Mode) ---
+# --- 7. GRAD-CAM & OVERLAY ---
 class GradCAM:
     def __init__(self, model, target_layer):
         self.model = model
         self.target_layer = target_layer
-        self.gradients = None
-        self.activations = None
+        self.gradients = None; self.activations = None
         target_layer.register_forward_hook(self.save_act)
         target_layer.register_full_backward_hook(self.save_grad)
     def save_act(self, m, i, o): self.activations = o
@@ -171,14 +213,12 @@ def predict():
         score = conf.item()
         res = detected_classes[idx.item()] if idx.item() < len(detected_classes) else "Unknown"
 
-        # Threshold Check
         if score < CONFIDENCE_THRESHOLD:
             os.remove(path)
             return jsonify({'result': 'Uncertain', 'confidence': f"{score*100:.1f}%", 'error': 'Low confidence'})
 
         resp = {'result': res, 'confidence': f"{score*100:.1f}%", 'heatmap': None}
 
-        # Doctor Mode
         if mode == 'doctor':
             try:
                 layer = None
@@ -196,4 +236,5 @@ def predict():
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=80)
+    port = int(os.environ.get('PORT', 80))
+    app.run(host='0.0.0.0', port=port)
