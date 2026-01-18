@@ -18,14 +18,12 @@ application = app  # Critical for AWS Elastic Beanstalk
 # --- 2. CONFIGURATION ---
 UPLOAD_FOLDER = '/tmp'
 MODEL_PATH = 'models/mammo_model.pth'
-CONFIDENCE_THRESHOLD = 0.50  # Lowered slightly to allow "Normal" to pass
+CONFIDENCE_THRESHOLD = 0.50
 MIN_VARIANCE = 50
 loaded_model = None
-
-# Default to 3 classes (Common for Medical Models: Benign, Malignant, Normal)
 detected_classes = ['Benign', 'Malignant', 'Normal']
 
-# --- 3. MODEL LOADER (Robust) ---
+# --- 3. MODEL LOADER ---
 def load_pytorch_model():
     global loaded_model, detected_classes
     print(f" * [STARTUP] Loading model from {MODEL_PATH}...")
@@ -39,7 +37,7 @@ def load_pytorch_model():
     try:
         # Load the dictionary
         state_dict = torch.load(MODEL_PATH, map_location=device, weights_only=False)
-        
+
         # Architecture Search Strategy
         combinations = [
             ("ResNet50 (3 Class)", models.resnet50, 3, ['Benign', 'Malignant', 'Normal']),
@@ -54,8 +52,6 @@ def load_pytorch_model():
                 temp_model = model_func(weights=None)
                 num_ftrs = temp_model.fc.in_features
                 temp_model.fc = nn.Linear(num_ftrs, num_classes)
-                
-                # Strict=False allows partial matching (ignores missing keys)
                 temp_model.load_state_dict(state_dict, strict=False)
                 
                 print("SUCCESS ✅")
@@ -75,45 +71,30 @@ def load_pytorch_model():
 
 load_pytorch_model()
 
-# --- 4. IMAGE VALIDATION ( The "Room Photo" Fix ) ---
+# --- 4. IMAGE VALIDATION ---
 def is_valid_medical_image(image_pil):
-    """
-    rejects images that are too dark, too bright, or COLORFUL (Room photos).
-    """
     try:
-        # 1. Convert to Numpy
         img_np = np.array(image_pil)
-        
-        # 2. Check for Color (Medical scans are Grayscale)
-        # If R, G, and B channels are very different, it's a color photo.
         if len(img_np.shape) == 3: # RGB Image
             r, g, b = img_np[:,:,0], img_np[:,:,1], img_np[:,:,2]
-            # Calculate variance between channels
             color_variance = np.mean(np.abs(r - g)) + np.mean(np.abs(r - b))
-            
-            # Threshold: If color variance > 15, it's likely a photo of a room/person
             if color_variance > 15:
                 return False, "Non-Medical Image Detected (Color)"
 
-        # 3. Check Brightness/Content
         gray = image_pil.convert('L')
         stat = ImageStat.Stat(gray)
-        
         if stat.mean[0] < 10: return False, "Image too dark/blank"
         if stat.var[0] < MIN_VARIANCE: return False, "Image has no content"
 
         return True, None
     except Exception as e:
         print(f"Validation Error: {e}")
-        return True, None # Default to true if check fails
+        return True, None
 
 # --- 5. PREPROCESSING ---
-# Updated to ensure consistency. 
-# We Resize to 224x224 and normalize using standard ImageNet stats.
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
-    # Standard ImageNet normalization (Matches most ResNet training)
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
 
@@ -132,87 +113,86 @@ class GradCAM:
     def save_grad(self, m, gi, go): self.gradients = go[0]
 
     def __call__(self, x):
-        self.gradients = None
-        self.activations = None
+        self.gradients = None; self.activations = None
         
-        # Forward pass
         out = self.model(x)
-        
-        # Zero grads
         self.model.zero_grad()
         
-        # Target the highest scoring class
         target_index = out.argmax(dim=1).item()
-        score = out[:, target_index]
-        
-        # Backward pass to get gradients
-        score.backward()
+        out[:, target_index].backward()
         
         if self.gradients is None or self.activations is None:
             return None
             
-        # Global Average Pooling of Gradients
         grads = self.gradients.data.numpy()[0]
         acts = self.activations.data.numpy()[0]
-        
         weights = np.mean(grads, axis=(1, 2))
         
-        # Weighted sum of activations
         cam = np.zeros(acts.shape[1:], dtype=np.float32)
-        for i, w in enumerate(weights):
-            cam += w * acts[i]
+        for i, w in enumerate(weights): cam += w * acts[i]
             
-        # ReLU (Discard negative activations)
         cam = np.maximum(cam, 0)
-        
-        # Resize to input size (224x224)
         cam = cv2.resize(cam, (224, 224))
-        
-        # Normalize 0-1
         cam = (cam - np.min(cam)) / (np.max(cam) + 1e-8)
         return cam
 
+# --- NEW HELPER: SMART LAYER FINDER ---
+def get_target_layer(model):
+    """
+    Automatically finds the correct last convolutional layer
+    Works for ResNet18 (conv2) AND ResNet50 (conv3)
+    """
+    try:
+        # Check standard ResNet structure
+        if hasattr(model, 'layer4'):
+            last_block = model.layer4[-1]
+            
+            # ResNet50 / 101 ends with 'conv3'
+            if hasattr(last_block, 'conv3'):
+                return last_block.conv3
+                
+            # ResNet18 / 34 ends with 'conv2'
+            if hasattr(last_block, 'conv2'):
+                return last_block.conv2
+                
+    except Exception as e:
+        print(f"Layer find error: {e}")
+
+    # Fallback: Just grab the very last Conv2d layer found
+    for module in reversed(list(model.modules())):
+        if isinstance(module, torch.nn.Conv2d):
+            return module
+    return None
+
 def generate_heatmap_overlay(image_path, heatmap):
-    # Load original image
     img = cv2.imread(image_path)
     img = cv2.resize(img, (224, 224))
-    
-    # Process Heatmap
     heatmap = np.uint8(255 * heatmap)
     heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
-    
-    # Superimpose (0.4 intensity)
     overlay = cv2.addWeighted(heatmap, 0.4, img, 0.6, 0)
-    
-    # Encode to Base64
     _, buffer = cv2.imencode('.jpg', overlay)
     return base64.b64encode(buffer).decode('utf-8')
 
 # --- 7. ROUTES ---
 @app.route('/predict', methods=['POST'])
 def predict():
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file part'}), 400
-        
+    if 'file' not in request.files: return jsonify({'error': 'No file part'}), 400
     file = request.files['file']
-    mode = request.form.get('mode', 'patient') # 'doctor' or 'patient'
+    mode = request.form.get('mode', 'patient')
 
-    if not loaded_model:
-        return jsonify({'error': 'Model not loaded on server'}), 503
+    if not loaded_model: return jsonify({'error': 'Model not loaded'}), 503
 
     try:
-        # Save temp file
         filename = secure_filename(file.filename)
         path = os.path.join(UPLOAD_FOLDER, filename)
         file.save(path)
 
-        # 1. VALIDATION GATE (Blocks Room/Cat Photos)
+        # 1. VALIDATION
         img_pil = Image.open(path).convert('RGB')
         is_valid, error_msg = is_valid_medical_image(img_pil)
-        
+
         if not is_valid:
             os.remove(path)
-            # Return specific error so Flutter shows Red Dialog
             return jsonify({
                 'result': 'Invalid',
                 'confidence': '0.0%',
@@ -222,22 +202,19 @@ def predict():
 
         # 2. PREDICTION
         input_tensor = transform(img_pil).unsqueeze(0).to('cpu')
-        
         with torch.no_grad():
             outputs = loaded_model(input_tensor)
-            probabilities = torch.nn.functional.softmax(outputs, dim=1)
-            confidence, class_idx = torch.max(probabilities, 1)
+            probs = torch.nn.functional.softmax(outputs, dim=1)
+            confidence, class_idx = torch.max(probs, 1)
 
         score = confidence.item()
         idx = class_idx.item()
-        
-        # Safety check for index
         prediction_label = detected_classes[idx] if idx < len(detected_classes) else "Unknown"
 
-        # 3. DOCTOR OUTPUT ENHANCEMENT
+        # 3. OUTPUT GENERATION
         heatmap_base64 = None
         recommendation = "No specific action required."
-        
+
         if prediction_label == 'Malignant':
             recommendation = "High Risk: Immediate biopsy and specialist consultation recommended."
         elif prediction_label == 'Benign':
@@ -245,20 +222,12 @@ def predict():
         elif prediction_label == 'Normal':
             recommendation = "Low Risk: No anomalies detected. Routine screening suggested."
 
-        # Generate GradCAM only for Doctor Mode OR High Risk
+        # Generate Heatmap (Updated Logic)
         if mode == 'doctor':
             try:
-                # Target the last convolutional layer (Standard for ResNet)
-                target_layer = list(loaded_model.modules())[-2][-1].conv2 if 'resnet' in str(type(loaded_model)).lower() else None
+                # Use the new Smart Layer Finder
+                target_layer = get_target_layer(loaded_model)
                 
-                # Fallback search for layer
-                if target_layer is None:
-                    # Generic fallback to last layer with parameters
-                    for layer in reversed(list(loaded_model.modules())):
-                        if isinstance(layer, torch.nn.Conv2d):
-                            target_layer = layer
-                            break
-
                 if target_layer:
                     cam_tool = GradCAM(loaded_model, target_layer)
                     heatmap_mask = cam_tool(input_tensor)
@@ -266,15 +235,13 @@ def predict():
                         heatmap_base64 = generate_heatmap_overlay(path, heatmap_mask)
             except Exception as e:
                 print(f"GradCAM Failed: {e}")
-                heatmap_base64 = None # Fail silently, don't crash app
+                heatmap_base64 = None
 
-        # Cleanup
-        if os.path.exists(path):
-            os.remove(path)
+        if os.path.exists(path): os.remove(path)
 
         return jsonify({
             'result': prediction_label,
-            'confidence': f"{score:.2f}", # Send as float-string "0.95"
+            'confidence': f"{score:.2f}",
             'heatmap': heatmap_base64,
             'recommendation': recommendation,
             'is_medical': True
