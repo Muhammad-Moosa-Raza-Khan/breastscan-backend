@@ -139,36 +139,51 @@ def get_target_layer(model):
     return None
 
 def generate_heatmap_overlay(original_pil, heatmap):
-    # 1. Convert PIL to OpenCV
+    # 1. Convert PIL to OpenCV (BGR format)
     img = np.array(original_pil)
-    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR) # Convert RGB to BGR for OpenCV
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
     
-    # 2. Strict Thresholding (Clean up the fog)
-    heatmap[heatmap < 0.40] = 0 
+    # 2. Gaussian Blur (The "Smoother")
+    # This blends the pixelated dots into a smooth coherent blob
+    # (15, 15) is the kernel size - larger means smoother
+    heatmap = cv2.GaussianBlur(heatmap, (15, 15), 0)
     
-    # 3. BACKGROUND REMOVAL (New Logic)
-    # If the original pixel is very dark (black background), FORCE heatmap to 0
-    # This stops the edges from glowing.
+    # 3. Thresholding (The "Noise Gate")
+    # Increase slightly to 0.45 to hide weak signals
+    heatmap[heatmap < 0.45] = 0 
+    
+    # 4. Normalize
+    if np.max(heatmap) > 0:
+        heatmap = heatmap / np.max(heatmap)
+
+    # 5. Create Background Mask (The "Edge Fix")
+    # Identify black padding pixels (where value < 10)
     gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    _, background_mask = cv2.threshold(gray_img, 20, 255, cv2.THRESH_BINARY)
+    _, tissue_mask = cv2.threshold(gray_img, 10, 255, cv2.THRESH_BINARY)
     
-    # Normalize Heatmap
-    if np.max(heatmap) > 0: heatmap = heatmap / np.max(heatmap)
-    
+    # Erosion: Shrink the mask slightly to move away from the sharp edges
+    kernel = np.ones((5,5), np.uint8)
+    tissue_mask = cv2.erode(tissue_mask, kernel, iterations=2)
+
+    # 6. Apply Heatmap Color
     heatmap_uint8 = np.uint8(255 * heatmap)
     heatmap_colored = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
 
-    # 4. Apply Masks
-    # Only show heatmap where:
-    # A. The AI is confident (heatmap > 0) AND
-    # B. The image is NOT black background (background_mask > 0)
-    final_mask = cv2.bitwise_and(heatmap_uint8, background_mask)
+    # 7. Final Combine
+    # Only show heat where:
+    # A. Heatmap exists AND
+    # B. We are on actual tissue (not padding)
+    final_heat_mask = cv2.bitwise_and(heatmap_uint8, tissue_mask)
     
     overlay = img.copy()
+    valid_indices = final_heat_mask > 0
     
-    # Blend only on valid pixels
-    heat_indices = final_mask > 0
-    overlay[heat_indices] = cv2.addWeighted(heatmap_colored[heat_indices], 0.6, img[heat_indices], 0.4, 0)
+    if np.any(valid_indices):
+         overlay[valid_indices] = cv2.addWeighted(
+             heatmap_colored[valid_indices], 0.6, 
+             img[valid_indices], 0.4, 
+             0
+         )
 
     _, buffer = cv2.imencode('.jpg', overlay)
     return base64.b64encode(buffer).decode('utf-8')
