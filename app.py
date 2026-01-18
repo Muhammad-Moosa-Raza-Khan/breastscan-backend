@@ -7,7 +7,7 @@ import cv2
 import torch
 import torch.nn as nn
 from torchvision import models, transforms
-from PIL import Image, ImageStat
+from PIL import Image, ImageStat, ImageOps
 from flask import Flask, request, jsonify
 from werkzeug.utils import secure_filename
 
@@ -18,12 +18,35 @@ application = app  # Critical for AWS Elastic Beanstalk
 # --- 2. CONFIGURATION ---
 UPLOAD_FOLDER = '/tmp'
 MODEL_PATH = 'models/mammo_model.pth'
-CONFIDENCE_THRESHOLD = 0.50
-MIN_VARIANCE = 50
 loaded_model = None
 detected_classes = ['Benign', 'Malignant', 'Normal']
 
-# --- 3. MODEL LOADER ---
+# --- 3. SMART RESIZING (THE FIX) ---
+def smart_resize_pad(image_pil, target_size=(224, 224)):
+    """
+    Resizes image to target_size WITHOUT squashing.
+    Adds black padding to keep the aspect ratio.
+    """
+    # 1. Calculate aspect ratio
+    w, h = image_pil.size
+    ratio = min(target_size[0]/w, target_size[1]/h)
+    new_w = int(w * ratio)
+    new_h = int(h * ratio)
+    
+    # 2. Resize with high-quality filter
+    img_resized = image_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    
+    # 3. Create black background
+    new_img = Image.new("RGB", target_size, (0, 0, 0))
+    
+    # 4. Paste resized image in center
+    paste_x = (target_size[0] - new_w) // 2
+    paste_y = (target_size[1] - new_h) // 2
+    new_img.paste(img_resized, (paste_x, paste_y))
+    
+    return new_img
+
+# --- 4. MODEL LOADER ---
 def load_pytorch_model():
     global loaded_model, detected_classes
     print(f" * [STARTUP] Loading model from {MODEL_PATH}...")
@@ -35,10 +58,8 @@ def load_pytorch_model():
     device = torch.device('cpu')
 
     try:
-        # Load the dictionary
         state_dict = torch.load(MODEL_PATH, map_location=device, weights_only=False)
 
-        # Architecture Search Strategy
         combinations = [
             ("ResNet50 (3 Class)", models.resnet50, 3, ['Benign', 'Malignant', 'Normal']),
             ("ResNet50 (2 Class)", models.resnet50, 2, ['Benign', 'Malignant']),
@@ -47,65 +68,38 @@ def load_pytorch_model():
         ]
 
         for name, model_func, num_classes, class_names in combinations:
-            print(f"   - Testing Architecture: {name}...", end=" ")
             try:
                 temp_model = model_func(weights=None)
                 num_ftrs = temp_model.fc.in_features
                 temp_model.fc = nn.Linear(num_ftrs, num_classes)
                 temp_model.load_state_dict(state_dict, strict=False)
                 
-                print("SUCCESS ✅")
+                print(f"SUCCESS: Loaded {name} ✅")
                 loaded_model = temp_model
                 detected_classes = class_names
                 loaded_model.eval()
                 return
-
-            except Exception:
-                print("Failed ❌")
+            except:
                 continue
-
-        print(" ! [CRITICAL] Could not match model architecture.")
-
     except Exception as e:
         print(f" ! [FATAL] Error loading model: {e}")
 
 load_pytorch_model()
 
-# --- 4. IMAGE VALIDATION ---
-def is_valid_medical_image(image_pil):
-    try:
-        img_np = np.array(image_pil)
-        if len(img_np.shape) == 3: # RGB Image
-            r, g, b = img_np[:,:,0], img_np[:,:,1], img_np[:,:,2]
-            color_variance = np.mean(np.abs(r - g)) + np.mean(np.abs(r - b))
-            if color_variance > 15:
-                return False, "Non-Medical Image Detected (Color)"
-
-        gray = image_pil.convert('L')
-        stat = ImageStat.Stat(gray)
-        if stat.mean[0] < 10: return False, "Image too dark/blank"
-        if stat.var[0] < MIN_VARIANCE: return False, "Image has no content"
-
-        return True, None
-    except Exception as e:
-        print(f"Validation Error: {e}")
-        return True, None
-
 # --- 5. PREPROCESSING ---
+# Removed Resize here because we do it manually in smart_resize_pad
 transform = transforms.Compose([
-    transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
 
-# --- 6. ADVANCED GRAD-CAM ---
+# --- 6. GRAD-CAM ---
 class GradCAM:
     def __init__(self, model, target_layer):
         self.model = model
         self.target_layer = target_layer
         self.gradients = None
         self.activations = None
-        
         target_layer.register_forward_hook(self.save_act)
         target_layer.register_full_backward_hook(self.save_grad)
 
@@ -114,15 +108,12 @@ class GradCAM:
 
     def __call__(self, x):
         self.gradients = None; self.activations = None
-        
         out = self.model(x)
         self.model.zero_grad()
-        
         target_index = out.argmax(dim=1).item()
         out[:, target_index].backward()
         
-        if self.gradients is None or self.activations is None:
-            return None
+        if self.gradients is None or self.activations is None: return None
             
         grads = self.gradients.data.numpy()[0]
         acts = self.activations.data.numpy()[0]
@@ -136,64 +127,48 @@ class GradCAM:
         cam = (cam - np.min(cam)) / (np.max(cam) + 1e-8)
         return cam
 
-# --- NEW HELPER: SMART LAYER FINDER ---
 def get_target_layer(model):
-    """
-    Automatically finds the correct last convolutional layer
-    Works for ResNet18 (conv2) AND ResNet50 (conv3)
-    """
     try:
-        # Check standard ResNet structure
         if hasattr(model, 'layer4'):
             last_block = model.layer4[-1]
-            
-            # ResNet50 / 101 ends with 'conv3'
-            if hasattr(last_block, 'conv3'):
-                return last_block.conv3
-                
-            # ResNet18 / 34 ends with 'conv2'
-            if hasattr(last_block, 'conv2'):
-                return last_block.conv2
-                
-    except Exception as e:
-        print(f"Layer find error: {e}")
-
-    # Fallback: Just grab the very last Conv2d layer found
+            if hasattr(last_block, 'conv3'): return last_block.conv3
+            if hasattr(last_block, 'conv2'): return last_block.conv2
+    except: pass
     for module in reversed(list(model.modules())):
-        if isinstance(module, torch.nn.Conv2d):
-            return module
+        if isinstance(module, torch.nn.Conv2d): return module
     return None
 
-def generate_heatmap_overlay(image_path, heatmap):
-    # 1. Load Original Image
-    img = cv2.imread(image_path)
-    img = cv2.resize(img, (224, 224))
+def generate_heatmap_overlay(original_pil, heatmap):
+    # 1. Convert PIL to OpenCV
+    img = np.array(original_pil)
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR) # Convert RGB to BGR for OpenCV
     
-    # --- FIX START: SHARPEN THE HEATMAP ---
+    # 2. Strict Thresholding (Clean up the fog)
+    heatmap[heatmap < 0.40] = 0 
     
-    # 2. Thresholding: Kill the Noise
-    # This says: "If a pixel is less than 35% 'hot', turn it off completely."
-    heatmap[heatmap < 0.35] = 0 
+    # 3. BACKGROUND REMOVAL (New Logic)
+    # If the original pixel is very dark (black background), FORCE heatmap to 0
+    # This stops the edges from glowing.
+    gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _, background_mask = cv2.threshold(gray_img, 20, 255, cv2.THRESH_BINARY)
     
-    # 3. Re-Normalize the "Hot" areas
-    if np.max(heatmap) > 0:
-        heatmap = heatmap / np.max(heatmap)
-
-    # 4. Color Mapping
+    # Normalize Heatmap
+    if np.max(heatmap) > 0: heatmap = heatmap / np.max(heatmap)
+    
     heatmap_uint8 = np.uint8(255 * heatmap)
     heatmap_colored = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
 
-    # 5. Smart Overlay
-    # Create a mask (Where is there heat?)
-    mask = heatmap > 0  # Boolean mask
+    # 4. Apply Masks
+    # Only show heatmap where:
+    # A. The AI is confident (heatmap > 0) AND
+    # B. The image is NOT black background (background_mask > 0)
+    final_mask = cv2.bitwise_and(heatmap_uint8, background_mask)
     
-    # Create the final image as a copy of the original
     overlay = img.copy()
     
-    # Only blend the color onto the "Hot" pixels
-    overlay[mask] = cv2.addWeighted(heatmap_colored[mask], 0.6, img[mask], 0.4, 0)
-    
-    # --- FIX END ---
+    # Blend only on valid pixels
+    heat_indices = final_mask > 0
+    overlay[heat_indices] = cv2.addWeighted(heatmap_colored[heat_indices], 0.6, img[heat_indices], 0.4, 0)
 
     _, buffer = cv2.imencode('.jpg', overlay)
     return base64.b64encode(buffer).decode('utf-8')
@@ -201,79 +176,58 @@ def generate_heatmap_overlay(image_path, heatmap):
 # --- 7. ROUTES ---
 @app.route('/predict', methods=['POST'])
 def predict():
-    if 'file' not in request.files: return jsonify({'error': 'No file part'}), 400
+    if 'file' not in request.files: return jsonify({'error': 'No file'}), 400
     file = request.files['file']
     mode = request.form.get('mode', 'patient')
 
     if not loaded_model: return jsonify({'error': 'Model not loaded'}), 503
 
     try:
-        filename = secure_filename(file.filename)
-        path = os.path.join(UPLOAD_FOLDER, filename)
-        file.save(path)
+        # 1. Load Image
+        img_pil = Image.open(file).convert('RGB')
+        
+        # 2. SMART RESIZE (Fixes Distortion)
+        img_processed = smart_resize_pad(img_pil)
 
-        # 1. VALIDATION
-        img_pil = Image.open(path).convert('RGB')
-        is_valid, error_msg = is_valid_medical_image(img_pil)
-
-        if not is_valid:
-            os.remove(path)
-            return jsonify({
-                'result': 'Invalid',
-                'confidence': '0.0%',
-                'error': error_msg,
-                'is_medical': False
-            })
-
-        # 2. PREDICTION
-        input_tensor = transform(img_pil).unsqueeze(0).to('cpu')
+        # 3. PREDICT
+        input_tensor = transform(img_processed).unsqueeze(0).to('cpu')
+        
         with torch.no_grad():
             outputs = loaded_model(input_tensor)
             probs = torch.nn.functional.softmax(outputs, dim=1)
             confidence, class_idx = torch.max(probs, 1)
 
         score = confidence.item()
-        idx = class_idx.item()
-        prediction_label = detected_classes[idx] if idx < len(detected_classes) else "Unknown"
+        prediction_label = detected_classes[class_idx.item()]
 
-        # 3. OUTPUT GENERATION
+        # 4. HEATMAP GENERATION
         heatmap_base64 = None
-        recommendation = "No specific action required."
+        recommendation = "No action."
+        
+        if prediction_label == 'Malignant': recommendation = "High Risk: Biopsy recommended."
+        elif prediction_label == 'Benign': recommendation = "Medium Risk: Monitor regularly."
+        elif prediction_label == 'Normal': recommendation = "Low Risk: Routine screening."
 
-        if prediction_label == 'Malignant':
-            recommendation = "High Risk: Immediate biopsy and specialist consultation recommended."
-        elif prediction_label == 'Benign':
-            recommendation = "Medium Risk: Monitor regularly. Schedule follow-up in 6 months."
-        elif prediction_label == 'Normal':
-            recommendation = "Low Risk: No anomalies detected. Routine screening suggested."
-
-        # Generate Heatmap (Updated Logic)
         if mode == 'doctor':
             try:
-                # Use the new Smart Layer Finder
                 target_layer = get_target_layer(loaded_model)
-                
                 if target_layer:
                     cam_tool = GradCAM(loaded_model, target_layer)
                     heatmap_mask = cam_tool(input_tensor)
                     if heatmap_mask is not None:
-                        heatmap_base64 = generate_heatmap_overlay(path, heatmap_mask)
+                        # Pass the PROCESSED (Padded) image to the overlay function
+                        heatmap_base64 = generate_heatmap_overlay(img_processed, heatmap_mask)
             except Exception as e:
-                print(f"GradCAM Failed: {e}")
-                heatmap_base64 = None
-
-        if os.path.exists(path): os.remove(path)
+                print(f"GradCAM Error: {e}")
 
         return jsonify({
             'result': prediction_label,
             'confidence': f"{score:.2f}",
             'heatmap': heatmap_base64,
-            'recommendation': recommendation,
-            'is_medical': True
+            'recommendation': recommendation
         })
 
     except Exception as e:
-        if os.path.exists(path): os.remove(path)
         return jsonify({'error': str(e)}), 500
 
 @app.route('/', methods=['GET'])
