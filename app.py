@@ -165,11 +165,36 @@ def get_target_layer(model):
     return None
 
 def generate_heatmap_overlay(image_path, heatmap):
+    # 1. Load Original Image
     img = cv2.imread(image_path)
     img = cv2.resize(img, (224, 224))
-    heatmap = np.uint8(255 * heatmap)
-    heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
-    overlay = cv2.addWeighted(heatmap, 0.4, img, 0.6, 0)
+    
+    # --- FIX START: SHARPEN THE HEATMAP ---
+    
+    # 2. Thresholding: Kill the Noise
+    # This says: "If a pixel is less than 35% 'hot', turn it off completely."
+    heatmap[heatmap < 0.35] = 0 
+    
+    # 3. Re-Normalize the "Hot" areas
+    if np.max(heatmap) > 0:
+        heatmap = heatmap / np.max(heatmap)
+
+    # 4. Color Mapping
+    heatmap_uint8 = np.uint8(255 * heatmap)
+    heatmap_colored = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+
+    # 5. Smart Overlay
+    # Create a mask (Where is there heat?)
+    mask = heatmap > 0  # Boolean mask
+    
+    # Create the final image as a copy of the original
+    overlay = img.copy()
+    
+    # Only blend the color onto the "Hot" pixels
+    overlay[mask] = cv2.addWeighted(heatmap_colored[mask], 0.6, img[mask], 0.4, 0)
+    
+    # --- FIX END ---
+
     _, buffer = cv2.imencode('.jpg', overlay)
     return base64.b64encode(buffer).decode('utf-8')
 
