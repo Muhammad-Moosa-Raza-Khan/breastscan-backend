@@ -33,8 +33,10 @@ def load_pytorch_model():
     device = torch.device('cpu')
 
     try:
+        # Load the dictionary
         state_dict = torch.load(MODEL_PATH, map_location=device, weights_only=False)
 
+        # Architecture Search Strategy
         combinations = [
             ("ResNet50 (3 Class)", models.resnet50, 3, ['Benign', 'Malignant', 'Normal']),
             ("ResNet50 (2 Class)", models.resnet50, 2, ['Benign', 'Malignant']),
@@ -61,15 +63,39 @@ def load_pytorch_model():
 
 load_pytorch_model()
 
-# --- 4. PREPROCESSING (REVERTED TO STANDARD) ---
-# We MUST use standard Resize. The model expects squashed images.
+# --- 4. PREPROCESSING ---
+# We use standard resize (squashing) because that is what the model expects.
 transform = transforms.Compose([
-    transforms.Resize((224, 224)), # This squashes it, but restores ACCURACY
+    transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
 
-# --- 5. GRAD-CAM ---
+# --- 5. TISSUE MASKING (The Key Feature from your Reference) ---
+def get_breast_mask(img_cv2):
+    """
+    Generates a binary mask where 1 = Breast Tissue, 0 = Background.
+    Uses Otsu's thresholding + Largest Contour detection.
+    """
+    # 1. Convert to Grayscale
+    gray = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
+    
+    # 2. Otsu's Thresholding (Automatic background detection)
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # 3. Find Contours
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # 4. Find Largest Contour (The Breast)
+    mask = np.zeros_like(gray)
+    if contours:
+        c = max(contours, key=cv2.contourArea)
+        # Draw the breast contour onto the mask
+        cv2.drawContours(mask, [c], -1, 255, thickness=cv2.FILLED)
+        
+    return mask
+
+# --- 6. GRAD-CAM ---
 class GradCAM:
     def __init__(self, model, target_layer):
         self.model = model
@@ -99,7 +125,8 @@ class GradCAM:
         for i, w in enumerate(weights): cam += w * acts[i]
             
         cam = np.maximum(cam, 0)
-        cam = cv2.resize(cam, (224, 224))
+        # Resize using BICUBIC for smoothness (like your reference)
+        cam = cv2.resize(cam, (224, 224), interpolation=cv2.INTER_CUBIC)
         cam = (cam - np.min(cam)) / (np.max(cam) + 1e-8)
         return cam
 
@@ -115,53 +142,47 @@ def get_target_layer(model):
     return None
 
 def generate_heatmap_overlay(original_pil, heatmap):
-    # 1. Convert PIL to OpenCV (BGR format)
+    # 1. Prepare Image
     img = np.array(original_pil)
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-    img = cv2.resize(img, (224, 224)) # Force resize to match tensor
+    img = cv2.resize(img, (224, 224))
     
-    # 2. Gaussian Blur (The "Smoother")
-    # This blends the pixelated dots into a smooth coherent blob
-    heatmap = cv2.GaussianBlur(heatmap, (15, 15), 0)
+    # 2. Get Tissue Mask (Isolate Breast)
+    tissue_mask_gray = get_breast_mask(img)
+    tissue_mask_bool = tissue_mask_gray > 0
     
-    # 3. Thresholding (The "Noise Gate")
-    # Increase to 0.40 to hide weak signals
+    # 3. Apply Mask to Heatmap IMMEDIATELY
+    # This ensures zero heat in the background
+    heatmap = heatmap * tissue_mask_bool
+    
+    # 4. Filter Weak Heat (Clean up noise inside the breast)
     heatmap[heatmap < 0.40] = 0 
     
-    # 4. Normalize
+    # 5. Normalize
     if np.max(heatmap) > 0:
         heatmap = heatmap / np.max(heatmap)
 
-    # 5. Create Background Mask (The "Edge Fix")
-    # Identify black background pixels
-    gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    _, tissue_mask = cv2.threshold(gray_img, 10, 255, cv2.THRESH_BINARY)
-    
-    # Erosion: Shrink the mask slightly to move away from edges
-    kernel = np.ones((5,5), np.uint8)
-    tissue_mask = cv2.erode(tissue_mask, kernel, iterations=2)
-
-    # 6. Apply Heatmap Color
+    # 6. Apply Color
     heatmap_uint8 = np.uint8(255 * heatmap)
     heatmap_colored = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
 
-    # 7. Final Combine
-    final_heat_mask = cv2.bitwise_and(heatmap_uint8, tissue_mask)
-    
+    # 7. Overlay
     overlay = img.copy()
-    valid_indices = final_heat_mask > 0
     
-    if np.any(valid_indices):
-         overlay[valid_indices] = cv2.addWeighted(
-             heatmap_colored[valid_indices], 0.6, 
-             img[valid_indices], 0.4, 
+    # Only blend where there is heat AND it is inside the breast tissue
+    final_mask = (heatmap > 0) & tissue_mask_bool
+    
+    if np.any(final_mask):
+         overlay[final_mask] = cv2.addWeighted(
+             heatmap_colored[final_mask], 0.6, 
+             img[final_mask], 0.4, 
              0
          )
 
     _, buffer = cv2.imencode('.jpg', overlay)
     return base64.b64encode(buffer).decode('utf-8')
 
-# --- 6. ROUTES ---
+# --- 7. ROUTES ---
 @app.route('/predict', methods=['POST'])
 def predict():
     if 'file' not in request.files: return jsonify({'error': 'No file'}), 400
@@ -171,13 +192,9 @@ def predict():
     if not loaded_model: return jsonify({'error': 'Model not loaded'}), 503
 
     try:
-        # 1. Load Image
         img_pil = Image.open(file).convert('RGB')
         
-        # 2. STANDARD RESIZE (Restores Accuracy)
-        # We removed smart_resize_pad. We let the transform handle squashing.
-        
-        # 3. PREDICT
+        # Standard Resize for Prediction Accuracy
         input_tensor = transform(img_pil).unsqueeze(0).to('cpu')
         
         with torch.no_grad():
@@ -188,7 +205,6 @@ def predict():
         score = confidence.item()
         prediction_label = detected_classes[class_idx.item()]
 
-        # 4. HEATMAP GENERATION
         heatmap_base64 = None
         recommendation = "No action."
         
@@ -203,7 +219,6 @@ def predict():
                     cam_tool = GradCAM(loaded_model, target_layer)
                     heatmap_mask = cam_tool(input_tensor)
                     if heatmap_mask is not None:
-                        # Pass ORIGINAL PIL (The helper handles resizing)
                         heatmap_base64 = generate_heatmap_overlay(img_pil, heatmap_mask)
             except Exception as e:
                 print(f"GradCAM Error: {e}")
@@ -223,5 +238,5 @@ def health_check():
     return "Breast Cancer AI Backend Online", 200
 
 if __name__ == '__main__':
-    # Force Port 5000 (Or 80 if running with sudo)
+    # PORT 80 ENABLED (Requires Sudo)
     app.run(host='0.0.0.0', port=80)
