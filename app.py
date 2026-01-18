@@ -7,13 +7,13 @@ import cv2
 import torch
 import torch.nn as nn
 from torchvision import models, transforms
-from PIL import Image, ImageStat, ImageOps
+from PIL import Image, ImageStat
 from flask import Flask, request, jsonify
 from werkzeug.utils import secure_filename
 
 # --- 1. INITIALIZE APP ---
 app = Flask(__name__)
-application = app  # Critical for AWS Elastic Beanstalk
+application = app 
 
 # --- 2. CONFIGURATION ---
 UPLOAD_FOLDER = '/tmp'
@@ -21,32 +21,7 @@ MODEL_PATH = 'models/mammo_model.pth'
 loaded_model = None
 detected_classes = ['Benign', 'Malignant', 'Normal']
 
-# --- 3. SMART RESIZING (THE FIX) ---
-def smart_resize_pad(image_pil, target_size=(224, 224)):
-    """
-    Resizes image to target_size WITHOUT squashing.
-    Adds black padding to keep the aspect ratio.
-    """
-    # 1. Calculate aspect ratio
-    w, h = image_pil.size
-    ratio = min(target_size[0]/w, target_size[1]/h)
-    new_w = int(w * ratio)
-    new_h = int(h * ratio)
-    
-    # 2. Resize with high-quality filter
-    img_resized = image_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
-    
-    # 3. Create black background
-    new_img = Image.new("RGB", target_size, (0, 0, 0))
-    
-    # 4. Paste resized image in center
-    paste_x = (target_size[0] - new_w) // 2
-    paste_y = (target_size[1] - new_h) // 2
-    new_img.paste(img_resized, (paste_x, paste_y))
-    
-    return new_img
-
-# --- 4. MODEL LOADER ---
+# --- 3. MODEL LOADER ---
 def load_pytorch_model():
     global loaded_model, detected_classes
     print(f" * [STARTUP] Loading model from {MODEL_PATH}...")
@@ -86,14 +61,15 @@ def load_pytorch_model():
 
 load_pytorch_model()
 
-# --- 5. PREPROCESSING ---
-# Removed Resize here because we do it manually in smart_resize_pad
+# --- 4. PREPROCESSING (REVERTED TO STANDARD) ---
+# We MUST use standard Resize. The model expects squashed images.
 transform = transforms.Compose([
+    transforms.Resize((224, 224)), # This squashes it, but restores ACCURACY
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
 
-# --- 6. GRAD-CAM ---
+# --- 5. GRAD-CAM ---
 class GradCAM:
     def __init__(self, model, target_layer):
         self.model = model
@@ -142,26 +118,26 @@ def generate_heatmap_overlay(original_pil, heatmap):
     # 1. Convert PIL to OpenCV (BGR format)
     img = np.array(original_pil)
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    img = cv2.resize(img, (224, 224)) # Force resize to match tensor
     
     # 2. Gaussian Blur (The "Smoother")
     # This blends the pixelated dots into a smooth coherent blob
-    # (15, 15) is the kernel size - larger means smoother
     heatmap = cv2.GaussianBlur(heatmap, (15, 15), 0)
     
     # 3. Thresholding (The "Noise Gate")
-    # Increase slightly to 0.45 to hide weak signals
-    heatmap[heatmap < 0.45] = 0 
+    # Increase to 0.40 to hide weak signals
+    heatmap[heatmap < 0.40] = 0 
     
     # 4. Normalize
     if np.max(heatmap) > 0:
         heatmap = heatmap / np.max(heatmap)
 
     # 5. Create Background Mask (The "Edge Fix")
-    # Identify black padding pixels (where value < 10)
+    # Identify black background pixels
     gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     _, tissue_mask = cv2.threshold(gray_img, 10, 255, cv2.THRESH_BINARY)
     
-    # Erosion: Shrink the mask slightly to move away from the sharp edges
+    # Erosion: Shrink the mask slightly to move away from edges
     kernel = np.ones((5,5), np.uint8)
     tissue_mask = cv2.erode(tissue_mask, kernel, iterations=2)
 
@@ -170,9 +146,6 @@ def generate_heatmap_overlay(original_pil, heatmap):
     heatmap_colored = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
 
     # 7. Final Combine
-    # Only show heat where:
-    # A. Heatmap exists AND
-    # B. We are on actual tissue (not padding)
     final_heat_mask = cv2.bitwise_and(heatmap_uint8, tissue_mask)
     
     overlay = img.copy()
@@ -188,7 +161,7 @@ def generate_heatmap_overlay(original_pil, heatmap):
     _, buffer = cv2.imencode('.jpg', overlay)
     return base64.b64encode(buffer).decode('utf-8')
 
-# --- 7. ROUTES ---
+# --- 6. ROUTES ---
 @app.route('/predict', methods=['POST'])
 def predict():
     if 'file' not in request.files: return jsonify({'error': 'No file'}), 400
@@ -201,11 +174,11 @@ def predict():
         # 1. Load Image
         img_pil = Image.open(file).convert('RGB')
         
-        # 2. SMART RESIZE (Fixes Distortion)
-        img_processed = smart_resize_pad(img_pil)
-
+        # 2. STANDARD RESIZE (Restores Accuracy)
+        # We removed smart_resize_pad. We let the transform handle squashing.
+        
         # 3. PREDICT
-        input_tensor = transform(img_processed).unsqueeze(0).to('cpu')
+        input_tensor = transform(img_pil).unsqueeze(0).to('cpu')
         
         with torch.no_grad():
             outputs = loaded_model(input_tensor)
@@ -230,8 +203,8 @@ def predict():
                     cam_tool = GradCAM(loaded_model, target_layer)
                     heatmap_mask = cam_tool(input_tensor)
                     if heatmap_mask is not None:
-                        # Pass the PROCESSED (Padded) image to the overlay function
-                        heatmap_base64 = generate_heatmap_overlay(img_processed, heatmap_mask)
+                        # Pass ORIGINAL PIL (The helper handles resizing)
+                        heatmap_base64 = generate_heatmap_overlay(img_pil, heatmap_mask)
             except Exception as e:
                 print(f"GradCAM Error: {e}")
 
@@ -250,5 +223,5 @@ def health_check():
     return "Breast Cancer AI Backend Online", 200
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 80))
-    app.run(host='0.0.0.0', port=port)
+    # Force Port 5000 (Or 80 if running with sudo)
+    app.run(host='0.0.0.0', port=80)
