@@ -130,66 +130,48 @@ def get_tissue_mask_advanced(img_cv2):
         h, w = img_cv2.shape[:2]
         return np.ones((h, w), dtype=np.uint8) * 255
 
-# --- 6. ADVANCED ANOMALY DETECTION ---
+# --- 6. ADVANCED ANOMALY DETECTION (For validation only) ---
 def comprehensive_abnormality_analysis(img_cv2):
-    """
-    Multi-level abnormality detection using computer vision
-    Returns: (severity_score, confidence, details_dict)
-    """
     try:
         gray = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY) if len(img_cv2.shape) == 3 else img_cv2
-        
-        # 1. CLAHE Enhancement
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
         
-        # 2. Detect HIGH INTENSITY regions (masses/calcifications)
-        # These appear as BRIGHT WHITE regions in mammograms
+        # Detect bright regions (masses/calcifications)
         _, bright_mask = cv2.threshold(enhanced, 210, 255, cv2.THRESH_BINARY)
-        
-        # 3. Find bright regions
         bright_contours, _ = cv2.findContours(bright_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        # Analyze each bright region
         suspicious_regions = []
         total_suspicious_area = 0
         
         for cnt in bright_contours:
             area = cv2.contourArea(cnt)
-            if area > 30:  # Minimum area threshold
-                # Get bounding box
+            if area > 30:
                 x, y, w, h = cv2.boundingRect(cnt)
-                
-                # Calculate circularity (masses are often round/oval)
                 perimeter = cv2.arcLength(cnt, True)
-                if perimeter > 0:
-                    circularity = 4 * np.pi * area / (perimeter * perimeter)
-                else:
-                    circularity = 0
+                circularity = 4 * np.pi * area / (perimeter * perimeter) if perimeter > 0 else 0
                 
-                # Get mean intensity in this region
                 mask = np.zeros(gray.shape, np.uint8)
                 cv2.drawContours(mask, [cnt], -1, 255, -1)
                 mean_intensity = cv2.mean(enhanced, mask=mask)[0]
                 
-                # Score this region
                 region_score = 0
-                if area > 100:  # Large bright region
+                if area > 100:
                     region_score += 3
                 elif area > 50:
                     region_score += 2
                 else:
                     region_score += 1
                 
-                if mean_intensity > 230:  # Very bright
+                if mean_intensity > 230:
                     region_score += 2
                 elif mean_intensity > 220:
                     region_score += 1
                 
-                if circularity > 0.6:  # Round/oval shape
+                if circularity > 0.6:
                     region_score += 1
                 
-                if region_score >= 3:  # Suspicious region
+                if region_score >= 3:
                     suspicious_regions.append({
                         'area': area,
                         'circularity': circularity,
@@ -199,7 +181,6 @@ def comprehensive_abnormality_analysis(img_cv2):
                     })
                     total_suspicious_area += area
         
-        # 4. Calculate overall severity
         num_suspicious = len(suspicious_regions)
         
         if num_suspicious == 0:
@@ -209,18 +190,18 @@ def comprehensive_abnormality_analysis(img_cv2):
         elif num_suspicious == 1:
             region = suspicious_regions[0]
             if region['area'] > 500 or region['intensity'] > 235:
-                severity = 0.8  # Likely malignant
+                severity = 0.8
                 category = "Malignant"
             else:
-                severity = 0.5  # Likely benign
+                severity = 0.5
                 category = "Benign"
             confidence = 0.7
-        else:  # Multiple suspicious regions
+        else:
             if any(r['area'] > 300 for r in suspicious_regions):
-                severity = 0.9  # Multiple large masses = high risk
+                severity = 0.9
                 category = "Malignant"
             else:
-                severity = 0.6  # Multiple small calcifications
+                severity = 0.6
                 category = "Benign"
             confidence = 0.8
         
@@ -313,58 +294,63 @@ def get_target_layer(model):
     
     return None
 
-def generate_cv_based_heatmap(img_cv2):
+def refine_gradcam_with_intensity(gradcam_mask, original_img):
     """
-    Generate heatmap based on actual tissue intensity (bright regions)
-    This is what the model SHOULD be looking at
+    Refines Grad-CAM by combining it with actual tissue intensity
+    This makes it focus more precisely on bright masses
     """
     try:
-        gray = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY) if len(img_cv2.shape) == 3 else img_cv2
+        gray = cv2.cvtColor(original_img, cv2.COLOR_BGR2GRAY) if len(original_img.shape) == 3 else original_img
         
-        # Enhance contrast
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
+        # Get intensity map (normalized)
+        intensity_map = gray.astype(np.float32) / 255.0
         
-        # Create heatmap based on intensity
-        # Bright areas = suspicious = high heat
-        normalized = enhanced.astype(np.float32) / 255.0
+        # Enhance bright regions
+        intensity_map = np.power(intensity_map, 0.7)  # Gamma correction
         
-        # Apply non-linear mapping to emphasize bright regions
-        heatmap = np.power(normalized, 0.5)  # Gamma correction
+        # Resize to match Grad-CAM
+        intensity_map = cv2.resize(intensity_map, (224, 224))
         
-        # Apply Gaussian blur for smooth visualization
-        heatmap = cv2.GaussianBlur(heatmap, (21, 21), 0)
+        # Combine: 70% Grad-CAM + 30% Intensity
+        # This guides Grad-CAM to focus more on bright areas
+        refined = (gradcam_mask * 0.7) + (intensity_map * 0.3)
         
-        return heatmap
+        # Normalize
+        if refined.max() > 0:
+            refined = refined / refined.max()
+        
+        return refined
     except Exception as e:
-        print(f"CV heatmap error: {e}")
-        return None
+        print(f"Refinement error: {e}")
+        return gradcam_mask
 
-def generate_heatmap_overlay(original_cv2, heatmap, prediction_label, use_cv_fallback=False):
-    """
-    Generate heatmap overlay with option to use CV-based heatmap
-    """
+def generate_heatmap_overlay(original_cv2, heatmap, prediction_label):
     try:
         img = original_cv2.copy()
         
-        # If we should use CV fallback (when model is wrong)
-        if use_cv_fallback or heatmap is None:
-            heatmap = generate_cv_based_heatmap(img)
-            if heatmap is None:
-                return None
+        # Refine heatmap with intensity information
+        heatmap = refine_gradcam_with_intensity(heatmap, img)
         
         tissue_mask = get_tissue_mask_advanced(img)
         tissue_bool = tissue_mask > 0
         masked_heatmap = heatmap * tissue_bool
         
-        # Lower threshold for better visibility
-        threshold = 0.20
+        # Adaptive threshold based on prediction
+        if prediction_label == 'Malignant':
+            threshold = 0.25
+        elif prediction_label == 'Benign':
+            threshold = 0.30
+        else:
+            threshold = 0.35
+        
         masked_heatmap[masked_heatmap < threshold] = 0
         
         if np.max(masked_heatmap) > 0:
             masked_heatmap = masked_heatmap / np.max(masked_heatmap)
         
-        masked_heatmap = cv2.GaussianBlur(masked_heatmap, (11, 11), 0)
+        # Smoother blur
+        masked_heatmap = cv2.GaussianBlur(masked_heatmap, (15, 15), 0)
+        
         heatmap_uint8 = np.uint8(255 * masked_heatmap)
         heatmap_colored = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
         
@@ -372,8 +358,8 @@ def generate_heatmap_overlay(original_cv2, heatmap, prediction_label, use_cv_fal
         heat_mask = (masked_heatmap > 0.01) & tissue_bool
         
         if np.any(heat_mask):
-            alpha = 0.7
-            beta = 0.3
+            alpha = 0.65
+            beta = 0.35
             overlay[heat_mask] = cv2.addWeighted(
                 heatmap_colored[heat_mask], alpha,
                 img[heat_mask], beta,
@@ -414,41 +400,49 @@ def predict():
         with torch.no_grad():
             outputs = loaded_model(input_tensor)
             probs = torch.nn.functional.softmax(outputs, dim=1)
+            
+            # Get all class probabilities
+            all_probs = probs[0].cpu().numpy()
             confidence, class_idx = torch.max(probs, 1)
 
         ai_score = confidence.item()
         ai_prediction = detected_classes[class_idx.item()]
         
-        # Computer Vision Analysis
+        # Computer Vision Analysis (for validation)
         cv_severity, cv_confidence, cv_details = comprehensive_abnormality_analysis(img_cropped)
         cv_prediction = cv_details.get('cv_prediction', 'Normal')
         
-        # INTELLIGENT OVERRIDE SYSTEM
+        # SMART OVERRIDE: Only if there's strong evidence
         override_active = False
         final_prediction = ai_prediction
         final_confidence = ai_score
         
-        # If CV detects significant abnormality but AI says Normal
-        if ai_prediction == 'Normal' and cv_severity > 0.5:
-            print(f"⚠️ OVERRIDE: AI said Normal but CV detected severity {cv_severity:.2f}")
+        # Calculate certainty margin
+        sorted_probs = np.sort(all_probs)[::-1]
+        certainty_margin = sorted_probs[0] - sorted_probs[1] if len(sorted_probs) > 1 else 1.0
+        
+        # Override only if:
+        # 1. Model is uncertain (low margin) AND CV strongly disagrees
+        # 2. CV detects very severe abnormality that model missed
+        
+        if ai_prediction == 'Normal' and cv_severity > 0.6 and certainty_margin < 0.3:
+            print(f"⚠️ OVERRIDE: AI uncertain ({certainty_margin:.2f}), CV severity {cv_severity:.2f}")
             override_active = True
             final_prediction = cv_prediction
             final_confidence = cv_confidence
         
-        # If CV detects HIGH severity but AI says Benign
-        elif ai_prediction == 'Benign' and cv_severity > 0.75:
-            print(f"⚠️ OVERRIDE: AI said Benign but CV detected high severity {cv_severity:.2f}")
+        elif ai_prediction == 'Benign' and cv_severity > 0.8:
+            print(f"⚠️ OVERRIDE: CV detected very high severity {cv_severity:.2f}")
             override_active = True
             final_prediction = 'Malignant'
             final_confidence = cv_confidence
         
         # Generate recommendation
-        recommendation = "No action."
         if final_prediction == 'Malignant':
             recommendation = "⚠️ HIGH RISK: Immediate biopsy and specialist consultation required."
         elif final_prediction == 'Benign':
             recommendation = "⚡ MEDIUM RISK: Close monitoring with follow-up imaging in 3-6 months."
-        elif final_prediction == 'Normal':
+        else:
             if cv_severity > 0.3:
                 recommendation = "✓ LOW-MEDIUM RISK: Routine screening recommended with follow-up."
             else:
@@ -456,36 +450,22 @@ def predict():
 
         heatmap_base64 = None
 
-        # Generate heatmap
+        # Generate Grad-CAM
         if mode == 'doctor':
             try:
-                use_cv_fallback = override_active  # Use CV heatmap if we overrode
-                
-                if not use_cv_fallback:
-                    # Try AI Grad-CAM first
-                    target_layer = get_target_layer(loaded_model)
-                    if target_layer:
-                        grad_cam = GradCAM(loaded_model, target_layer)
-                        cam_mask = grad_cam(input_tensor, class_idx=class_idx.item())
-                        
-                        if cam_mask is not None:
-                            heatmap_base64 = generate_heatmap_overlay(
-                                img_final, 
-                                cam_mask, 
-                                final_prediction,
-                                use_cv_fallback=False
-                            )
-                        
-                        grad_cam.remove_hooks()
-                
-                # If AI heatmap failed or override active, use CV heatmap
-                if heatmap_base64 is None or use_cv_fallback:
-                    heatmap_base64 = generate_heatmap_overlay(
-                        img_final,
-                        None,
-                        final_prediction,
-                        use_cv_fallback=True
-                    )
+                target_layer = get_target_layer(loaded_model)
+                if target_layer:
+                    grad_cam = GradCAM(loaded_model, target_layer)
+                    cam_mask = grad_cam(input_tensor, class_idx=class_idx.item())
+                    
+                    if cam_mask is not None:
+                        heatmap_base64 = generate_heatmap_overlay(
+                            img_final, 
+                            cam_mask, 
+                            final_prediction
+                        )
+                    
+                    grad_cam.remove_hooks()
                     
             except Exception as e:
                 print(f"Heatmap generation error: {e}")
@@ -502,6 +482,7 @@ def predict():
                 'cv_severity': f"{cv_severity:.2f}",
                 'suspicious_regions': cv_details.get('suspicious_regions', 0),
                 'override_active': override_active,
+                'certainty_margin': f"{certainty_margin:.2f}",
                 'total_suspicious_area': cv_details.get('total_area', 0),
                 'max_intensity': cv_details.get('max_intensity', 0)
             }
