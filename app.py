@@ -6,502 +6,325 @@ import numpy as np
 import cv2
 import torch
 import torch.nn as nn
-from torchvision import models, transforms
-from PIL import Image, ImageStat
+import torch.nn.functional as F
+import gc
+import timm
+from scipy.fftpack import dct
+from torchvision import transforms
+from PIL import Image
 from flask import Flask, request, jsonify
+from werkzeug.utils import secure_filename
 
 # --- 1. INITIALIZE APP ---
 app = Flask(__name__)
 application = app
 
-# --- 2. CONFIGURATION ---
-UPLOAD_FOLDER = '/tmp'
-MODEL_PATH = 'models/mammo_model.pth'
-loaded_model = None
-detected_classes = ['Benign', 'Malignant', 'Normal']
+# --- 2. THE MODEL REGISTRY ---
+MODEL_REGISTRY = {
+    'histopathology': {
+        'path': 'models/breakhis_model.pth',
+        'classes': ['Benign', 'Malignant']
+    },
+    'mri': {
+        'path': 'models/mri_kaggle_model.pth',
+        'classes': ['Healthy', 'Sick']
+    },
+    'mammogram': {
+        'path': 'models/mias_dmid_model.pth', 
+        'classes': ['Normal', 'Benign', 'Malignant'] # Order matches your config
+    },
+    'ultrasound': {
+        'path': 'models/ultrasound_model.pth',
+        'classes': ['Normal', 'Benign', 'Malignant']
+    }
+}
 
-# --- 3. MODEL LOADER ---
-def load_pytorch_model():
-    global loaded_model, detected_classes
-    print(f" * [STARTUP] Loading model from {MODEL_PATH}...")
+# --- 3. FREQUENCY EXTRACTOR (Required for RAM-Net) ---
+class FastFrequencyAnalysis:
+    @staticmethod
+    def dct_transform_fast(img):
+        if len(img.shape) == 3:
+            gray = cv2.cvtColor((img * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+            freq = dct(dct(gray.T, norm='ortho').T, norm='ortho')
+            freq = np.stack([freq, freq, freq], axis=2)
+        else:
+            freq = dct(dct(img.T, norm='ortho').T, norm='ortho')
+            freq = np.stack([freq, freq, freq], axis=2)
+        return freq
 
-    if not os.path.exists(MODEL_PATH):
-        print(" ! [ERROR] Model file not found.")
-        return
+    @staticmethod
+    def extract_low_freq_fast(img):
+        dct_feat = FastFrequencyAnalysis.dct_transform_fast(img)
+        h, w = dct_feat.shape[:2]
+        cutoff_h, cutoff_w = int(h*0.3), int(w*0.3)
+        low_freq = dct_feat.copy()
+        low_freq[cutoff_h:, :] = 0
+        low_freq[:, cutoff_w:] = 0
+        return low_freq
 
-    device = torch.device('cpu')
+# --- 4. RAM-NET (MedFormer-ULTRA) ARCHITECTURE ---
+class EfficientAttention(nn.Module):
+    def __init__(self, dim, num_heads=4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.proj = nn.Linear(dim, dim)
+        
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        return x
 
-    try:
-        state_dict = torch.load(MODEL_PATH, map_location=device, weights_only=False)
-        combinations = [
-            ("ResNet50 (3 Class)", models.resnet50, 3, ['Benign', 'Malignant', 'Normal']),
-            ("ResNet50 (2 Class)", models.resnet50, 2, ['Benign', 'Malignant']),
-            ("ResNet18 (3 Class)", models.resnet18, 3, ['Benign', 'Malignant', 'Normal']),
-            ("ResNet18 (2 Class)", models.resnet18, 2, ['Benign', 'Malignant']),
-        ]
+class ExpertBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, groups=channels),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, 1),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True)
+        )
+    def forward(self, x):
+        return self.conv(x)
 
-        for name, model_func, num_classes, class_names in combinations:
-            try:
-                temp_model = model_func(weights=None)
-                num_ftrs = temp_model.fc.in_features
-                temp_model.fc = nn.Linear(num_ftrs, num_classes)
-                temp_model.load_state_dict(state_dict, strict=False)
-                print(f"SUCCESS: Loaded {name}")
-                loaded_model = temp_model
-                detected_classes = class_names
-                loaded_model.eval()
-                return
-            except Exception as e:
-                continue
-    except Exception as e:
-        print(f" ! [FATAL] Error loading model: {e}")
+class MoE(nn.Module):
+    def __init__(self, channels, num_experts=3):
+        super().__init__()
+        self.num_experts = num_experts
+        self.experts = nn.ModuleList([ExpertBlock(channels) for _ in range(num_experts)])
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(channels, num_experts),
+            nn.Softmax(dim=1)
+        )
+    def forward(self, x):
+        weights = self.gate(x)
+        expert_outputs = [expert(x) for expert in self.experts]
+        stacked = torch.stack(expert_outputs, dim=1)
+        weights = weights.view(-1, self.num_experts, 1, 1, 1)
+        output = (stacked * weights).sum(dim=1)
+        return output, weights.squeeze()
 
-load_pytorch_model()
+class RAMNet(nn.Module):
+    def __init__(self, num_classes=3, feature_dim=256, num_experts=3):
+        super().__init__()
+        self.backbone = timm.create_model('tf_efficientnetv2_s', pretrained=False, features_only=True)
+        
+        # Determine feature dims by passing a dummy tensor
+        with torch.no_grad():
+            dummy = torch.randn(1, 3, 224, 224)
+            feats = self.backbone(dummy)
+        self.feat_dims = [feats[-2].shape[1], feats[-1].shape[1]]
+        
+        common_dim = feature_dim
+        self.proj1 = nn.Sequential(nn.Conv2d(self.feat_dims[0], common_dim, 1), nn.BatchNorm2d(common_dim), nn.ReLU(inplace=True))
+        self.proj2 = nn.Sequential(nn.Conv2d(self.feat_dims[1], common_dim, 1), nn.BatchNorm2d(common_dim), nn.ReLU(inplace=True))
+        
+        self.freq_encoder = nn.Sequential(
+            nn.Conv2d(3, 32, 5, stride=2, padding=2), nn.BatchNorm2d(32), nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1)
+        )
+        
+        self.moe = MoE(common_dim, num_experts)
+        self.attention = EfficientAttention(common_dim, num_heads=4)
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        
+        self.fusion = nn.Sequential(
+            nn.Linear(common_dim + 64, 512), nn.LayerNorm(512), nn.ReLU(inplace=True), nn.Dropout(0.4)
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(512, 256), nn.LayerNorm(256), nn.ReLU(inplace=True), nn.Dropout(0.3), nn.Linear(256, num_classes)
+        )
+        self.aux_classifier = nn.Linear(common_dim, num_classes)
+        
+    def forward(self, x, freq, return_all=False):
+        feats = self.backbone(x)
+        f1, f2 = self.proj1(feats[-2]), self.proj2(feats[-1])
+        if f1.shape[2:] != f2.shape[2:]:
+            f1 = F.adaptive_avg_pool2d(f1, f2.shape[2:])
+        
+        fused = f1 + f2
+        feat, gate_weights = self.moe(fused)
+        
+        B, C, H, W = feat.shape
+        feat_down = F.adaptive_avg_pool2d(feat, (H//2, W//2))
+        feat_flat = feat_down.flatten(2).transpose(1, 2)
+        feat_att = self.attention(feat_flat)
+        feat_spatial = feat_att.transpose(1, 2).reshape(B, C, H//2, W//2)
+        feat_spatial = F.interpolate(feat_spatial, size=(H, W), mode='bilinear', align_corners=False)
+        feat = feat + feat_spatial
+        
+        pooled = self.global_pool(feat).flatten(1)
+        freq_feat = self.freq_encoder(freq).flatten(1)
+        combined = torch.cat([pooled, freq_feat], dim=1)
+        fused_feat = self.fusion(combined)
+        
+        logits = self.classifier(fused_feat)
+        aux_logits = self.aux_classifier(pooled)
+        
+        if return_all: return logits, aux_logits, gate_weights
+        return logits, aux_logits
 
-# --- 4. PREPROCESSING ---
+# --- 5. THE MATHEMATICAL GATEKEEPER ---
+def detect_image_modality(img_cv2):
+    hsv = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2HSV)
+    saturation = hsv[:, :, 1].mean()
+    if saturation > 40: return 'histopathology'
+
+    gray = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
+    black_pixels = np.sum(gray < 15)
+    total_pixels = gray.shape[0] * gray.shape[1]
+    
+    if (black_pixels / total_pixels) > 0.40: return 'mammogram'
+    
+    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    if laplacian_var > 500: return 'ultrasound'
+    return 'mri'
+
+# --- 6. PREPROCESSING & DUAL-INPUT GRAD-CAM ---
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
 
-# --- 5. IMAGE PROCESSING ---
-def preprocess_mammogram(img_cv2):
-    try:
-        if len(img_cv2.shape) == 3:
-            gray = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = img_cv2.copy()
-        
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
-        denoised = cv2.bilateralFilter(enhanced, 9, 75, 75)
-        
-        if len(img_cv2.shape) == 3:
-            processed = cv2.cvtColor(denoised, cv2.COLOR_GRAY2BGR)
-        else:
-            processed = cv2.cvtColor(denoised, cv2.COLOR_GRAY2BGR)
-        
-        return processed
-    except Exception as e:
-        print(f"Preprocessing error: {e}")
-        return img_cv2
+def get_tissue_mask(img_cv2):
+    gray = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return cv2.erode(thresh, np.ones((10, 10), np.uint8), iterations=2)
 
-def crop_to_breast_tissue(img_cv2):
-    try:
-        gray = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY) if len(img_cv2.shape) == 3 else img_cv2
-        _, thresh = cv2.threshold(gray, 20, 255, cv2.THRESH_BINARY)
-        
-        kernel = np.ones((5, 5), np.uint8)
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
-        
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        if contours:
-            c = max(contours, key=cv2.contourArea)
-            x, y, w, h = cv2.boundingRect(c)
-            pad = max(5, min(w, h) // 20)
-            h_img, w_img = img_cv2.shape[:2]
-            x1 = max(0, x - pad)
-            y1 = max(0, y - pad)
-            x2 = min(w_img, x + w + pad)
-            y2 = min(h_img, y + h + pad)
-            return img_cv2[y1:y2, x1:x2]
-
-        return img_cv2
-    except Exception as e:
-        print(f"Crop error: {e}")
-        return img_cv2
-
-def get_tissue_mask_advanced(img_cv2):
-    try:
-        gray = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY) if len(img_cv2.shape) == 3 else img_cv2
-        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        
-        kernel = np.ones((5, 5), np.uint8)
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=3)
-        erode_kernel = np.ones((7, 7), np.uint8)
-        thresh = cv2.erode(thresh, erode_kernel, iterations=1)
-        
-        return thresh
-    except Exception as e:
-        print(f"Mask error: {e}")
-        h, w = img_cv2.shape[:2]
-        return np.ones((h, w), dtype=np.uint8) * 255
-
-# --- 6. ADVANCED ANOMALY DETECTION (For validation only) ---
-def comprehensive_abnormality_analysis(img_cv2):
-    try:
-        gray = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY) if len(img_cv2.shape) == 3 else img_cv2
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
-        
-        # Detect bright regions (masses/calcifications)
-        _, bright_mask = cv2.threshold(enhanced, 210, 255, cv2.THRESH_BINARY)
-        bright_contours, _ = cv2.findContours(bright_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        suspicious_regions = []
-        total_suspicious_area = 0
-        
-        for cnt in bright_contours:
-            area = cv2.contourArea(cnt)
-            if area > 30:
-                x, y, w, h = cv2.boundingRect(cnt)
-                perimeter = cv2.arcLength(cnt, True)
-                circularity = 4 * np.pi * area / (perimeter * perimeter) if perimeter > 0 else 0
-                
-                mask = np.zeros(gray.shape, np.uint8)
-                cv2.drawContours(mask, [cnt], -1, 255, -1)
-                mean_intensity = cv2.mean(enhanced, mask=mask)[0]
-                
-                region_score = 0
-                if area > 100:
-                    region_score += 3
-                elif area > 50:
-                    region_score += 2
-                else:
-                    region_score += 1
-                
-                if mean_intensity > 230:
-                    region_score += 2
-                elif mean_intensity > 220:
-                    region_score += 1
-                
-                if circularity > 0.6:
-                    region_score += 1
-                
-                if region_score >= 3:
-                    suspicious_regions.append({
-                        'area': area,
-                        'circularity': circularity,
-                        'intensity': mean_intensity,
-                        'score': region_score,
-                        'bbox': (x, y, w, h)
-                    })
-                    total_suspicious_area += area
-        
-        num_suspicious = len(suspicious_regions)
-        
-        if num_suspicious == 0:
-            severity = 0.0
-            confidence = 0.9
-            category = "Normal"
-        elif num_suspicious == 1:
-            region = suspicious_regions[0]
-            if region['area'] > 500 or region['intensity'] > 235:
-                severity = 0.8
-                category = "Malignant"
-            else:
-                severity = 0.5
-                category = "Benign"
-            confidence = 0.7
-        else:
-            if any(r['area'] > 300 for r in suspicious_regions):
-                severity = 0.9
-                category = "Malignant"
-            else:
-                severity = 0.6
-                category = "Benign"
-            confidence = 0.8
-        
-        details = {
-            'suspicious_regions': num_suspicious,
-            'total_area': int(total_suspicious_area),
-            'largest_region': max([r['area'] for r in suspicious_regions]) if suspicious_regions else 0,
-            'max_intensity': max([r['intensity'] for r in suspicious_regions]) if suspicious_regions else 0,
-            'cv_prediction': category
-        }
-        
-        return severity, confidence, details
-        
-    except Exception as e:
-        print(f"Abnormality analysis error: {e}")
-        return 0.0, 0.0, {}
-
-# --- 7. IMPROVED GRAD-CAM ---
-class GradCAM:
+class DualInputGradCAM:
     def __init__(self, model, target_layer):
         self.model = model
         self.target_layer = target_layer
         self.gradients = None
         self.activations = None
-        self.hooks = []
-        
-        self.hooks.append(target_layer.register_forward_hook(self.save_activation))
-        self.hooks.append(target_layer.register_full_backward_hook(self.save_gradient))
+        target_layer.register_forward_hook(self.save_act)
+        target_layer.register_full_backward_hook(self.save_grad)
 
-    def save_activation(self, module, input, output):
-        self.activations = output.detach()
+    def save_act(self, m, i, o): self.activations = o
+    def save_grad(self, m, gi, go): self.gradients = go[0]
 
-    def save_gradient(self, module, grad_input, grad_output):
-        self.gradients = grad_output[0].detach()
+    def __call__(self, x, freq):
+        self.gradients = None; self.activations = None
+        # RAM-Net returns logits and aux_logits. We only want logits [0]
+        out = self.model(x, freq)[0] 
+        self.model.zero_grad()
+        target_index = out.argmax(dim=1).item()
+        out[:, target_index].backward()
+        
+        if self.gradients is None or self.activations is None: return None
+        grads = self.gradients.data.numpy()[0]
+        acts = self.activations.data.numpy()[0]
+        weights = np.mean(grads, axis=(1, 2))
+        
+        cam = np.zeros(acts.shape[1:], dtype=np.float32)
+        for i, w in enumerate(weights): cam += w * acts[i]
+        cam = np.maximum(cam, 0)
+        cam = cv2.resize(cam, (224, 224), interpolation=cv2.INTER_CUBIC)
+        return (cam - np.min(cam)) / (np.max(cam) + 1e-8)
 
-    def remove_hooks(self):
-        for hook in self.hooks:
-            hook.remove()
+def generate_heatmap_overlay(original_cv2, heatmap):
+    img = cv2.resize(original_cv2, (224, 224))
+    tissue_mask = get_tissue_mask(img)
+    tissue_bool = tissue_mask > 0
+    heatmap = heatmap * tissue_bool
+    heatmap[heatmap < 0.35] = 0 
+    if np.max(heatmap) > 0: heatmap = heatmap / np.max(heatmap)
+    heatmap_colored = cv2.applyColorMap(np.uint8(255 * heatmap), cv2.COLORMAP_JET)
+    overlay = img.copy()
+    final_mask = (heatmap > 0) & tissue_bool
+    if np.any(final_mask):
+         overlay[final_mask] = cv2.addWeighted(heatmap_colored[final_mask], 0.6, img[final_mask], 0.4, 0)
+    _, buffer = cv2.imencode('.jpg', overlay)
+    return base64.b64encode(buffer).decode('utf-8')
 
-    def __call__(self, x, class_idx=None):
-        try:
-            self.model.eval()
-            output = self.model(x)
-            
-            if class_idx is None:
-                class_idx = output.argmax(dim=1).item()
-            
-            self.model.zero_grad()
-            output[:, class_idx].backward(retain_graph=True)
-            
-            if self.gradients is None or self.activations is None:
-                return None
-            
-            gradients = self.gradients.cpu().numpy()[0]
-            activations = self.activations.cpu().numpy()[0]
-            weights = np.mean(gradients, axis=(1, 2))
-            
-            cam = np.zeros(activations.shape[1:], dtype=np.float32)
-            for i, w in enumerate(weights):
-                cam += w * activations[i]
-            
-            cam = np.maximum(cam, 0)
-            cam = cv2.resize(cam, (224, 224), interpolation=cv2.INTER_CUBIC)
-            
-            if cam.max() > 0:
-                cam = cam / cam.max()
-            
-            return cam
-        except Exception as e:
-            print(f"GradCAM calculation error: {e}")
-            return None
-
-def get_target_layer(model):
-    try:
-        if hasattr(model, 'layer4'):
-            last_block = model.layer4[-1]
-            if hasattr(last_block, 'conv3'):
-                return last_block.conv3
-            if hasattr(last_block, 'conv2'):
-                return last_block.conv2
-    except Exception as e:
-        print(f"Error getting layer4: {e}")
-    
-    try:
-        for module in reversed(list(model.modules())):
-            if isinstance(module, torch.nn.Conv2d):
-                return module
-    except Exception as e:
-        print(f"Error finding conv layer: {e}")
-    
-    return None
-
-def refine_gradcam_with_intensity(gradcam_mask, original_img):
-    """
-    Refines Grad-CAM by combining it with actual tissue intensity
-    This makes it focus more precisely on bright masses
-    """
-    try:
-        gray = cv2.cvtColor(original_img, cv2.COLOR_BGR2GRAY) if len(original_img.shape) == 3 else original_img
-        
-        # Get intensity map (normalized)
-        intensity_map = gray.astype(np.float32) / 255.0
-        
-        # Enhance bright regions
-        intensity_map = np.power(intensity_map, 0.7)  # Gamma correction
-        
-        # Resize to match Grad-CAM
-        intensity_map = cv2.resize(intensity_map, (224, 224))
-        
-        # Combine: 70% Grad-CAM + 30% Intensity
-        # This guides Grad-CAM to focus more on bright areas
-        refined = (gradcam_mask * 0.7) + (intensity_map * 0.3)
-        
-        # Normalize
-        if refined.max() > 0:
-            refined = refined / refined.max()
-        
-        return refined
-    except Exception as e:
-        print(f"Refinement error: {e}")
-        return gradcam_mask
-
-def generate_heatmap_overlay(original_cv2, heatmap, prediction_label):
-    try:
-        img = original_cv2.copy()
-        
-        # Refine heatmap with intensity information
-        heatmap = refine_gradcam_with_intensity(heatmap, img)
-        
-        tissue_mask = get_tissue_mask_advanced(img)
-        tissue_bool = tissue_mask > 0
-        masked_heatmap = heatmap * tissue_bool
-        
-        # Adaptive threshold based on prediction
-        if prediction_label == 'Malignant':
-            threshold = 0.25
-        elif prediction_label == 'Benign':
-            threshold = 0.30
-        else:
-            threshold = 0.35
-        
-        masked_heatmap[masked_heatmap < threshold] = 0
-        
-        if np.max(masked_heatmap) > 0:
-            masked_heatmap = masked_heatmap / np.max(masked_heatmap)
-        
-        # Smoother blur
-        masked_heatmap = cv2.GaussianBlur(masked_heatmap, (15, 15), 0)
-        
-        heatmap_uint8 = np.uint8(255 * masked_heatmap)
-        heatmap_colored = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
-        
-        overlay = img.copy()
-        heat_mask = (masked_heatmap > 0.01) & tissue_bool
-        
-        if np.any(heat_mask):
-            alpha = 0.65
-            beta = 0.35
-            overlay[heat_mask] = cv2.addWeighted(
-                heatmap_colored[heat_mask], alpha,
-                img[heat_mask], beta,
-                0
-            )
-        
-        _, buffer = cv2.imencode('.jpg', overlay, [cv2.IMWRITE_JPEG_QUALITY, 95])
-        return base64.b64encode(buffer).decode('utf-8')
-    except Exception as e:
-        print(f"Heatmap overlay error: {e}")
-        return None
-
-# --- 8. ROUTES ---
+# --- 7. ROUTING ENDPOINT ---
 @app.route('/predict', methods=['POST'])
 def predict():
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file uploaded'}), 400
-    
+    if 'file' not in request.files: return jsonify({'error': 'No file'}), 400
     file = request.files['file']
     mode = request.form.get('mode', 'patient')
 
-    if not loaded_model:
-        return jsonify({'error': 'Model not loaded'}), 503
-
     try:
+        # 1. Load Image
         img_pil = Image.open(file).convert('RGB')
-        img_cv2 = np.array(img_pil)
+        img_cv2 = np.array(img_pil) 
         img_cv2 = cv2.cvtColor(img_cv2, cv2.COLOR_RGB2BGR)
+        
+        # 2. THE GATEKEEPER
+        modality_key = detect_image_modality(img_cv2)
+        model_config = MODEL_REGISTRY[modality_key]
+        
+        # 3. GENERATE FREQUENCY DATA (For RAM-Net)
+        img_for_freq = cv2.resize(img_cv2, (224, 224)).astype(np.float32) / 255.0
+        low_freq = FastFrequencyAnalysis.extract_low_freq_fast(img_for_freq)
+        freq_tensor = torch.from_numpy(low_freq.transpose(2, 0, 1)).float().unsqueeze(0).to('cpu')
+        
+        # 4. LOAD MODEL DYNAMICALLY
+        device = torch.device('cpu')
+        loaded_model = RAMNet(num_classes=len(model_config['classes']))
+        
+        state_dict = torch.load(model_config['path'], map_location=device, weights_only=False)
+        # If your state dict has a 'model_state_dict' key (as seen in your code), extract it:
+        if 'model_state_dict' in state_dict: state_dict = state_dict['model_state_dict']
+        
+        loaded_model.load_state_dict(state_dict, strict=False)
+        loaded_model.eval()
 
-        img_cropped = crop_to_breast_tissue(img_cv2)
-        img_processed = preprocess_mammogram(img_cropped)
-        img_final = cv2.resize(img_processed, (224, 224))
-
-        # AI Model Prediction
-        img_pil_final = Image.fromarray(cv2.cvtColor(img_final, cv2.COLOR_BGR2RGB))
-        input_tensor = transform(img_pil_final).unsqueeze(0).to('cpu')
-
+        # 5. PREDICT
+        input_tensor = transform(img_pil).unsqueeze(0).to(device)
         with torch.no_grad():
-            outputs = loaded_model(input_tensor)
+            outputs, _ = loaded_model(input_tensor, freq_tensor)
             probs = torch.nn.functional.softmax(outputs, dim=1)
-            
-            # Get all class probabilities
-            all_probs = probs[0].cpu().numpy()
             confidence, class_idx = torch.max(probs, 1)
 
-        ai_score = confidence.item()
-        ai_prediction = detected_classes[class_idx.item()]
-        
-        # Computer Vision Analysis (for validation)
-        cv_severity, cv_confidence, cv_details = comprehensive_abnormality_analysis(img_cropped)
-        cv_prediction = cv_details.get('cv_prediction', 'Normal')
-        
-        # SMART OVERRIDE: Only if there's strong evidence
-        override_active = False
-        final_prediction = ai_prediction
-        final_confidence = ai_score
-        
-        # Calculate certainty margin
-        sorted_probs = np.sort(all_probs)[::-1]
-        certainty_margin = sorted_probs[0] - sorted_probs[1] if len(sorted_probs) > 1 else 1.0
-        
-        # Override only if:
-        # 1. Model is uncertain (low margin) AND CV strongly disagrees
-        # 2. CV detects very severe abnormality that model missed
-        
-        if ai_prediction == 'Normal' and cv_severity > 0.6 and certainty_margin < 0.3:
-            print(f"⚠️ OVERRIDE: AI uncertain ({certainty_margin:.2f}), CV severity {cv_severity:.2f}")
-            override_active = True
-            final_prediction = cv_prediction
-            final_confidence = cv_confidence
-        
-        elif ai_prediction == 'Benign' and cv_severity > 0.8:
-            print(f"⚠️ OVERRIDE: CV detected very high severity {cv_severity:.2f}")
-            override_active = True
-            final_prediction = 'Malignant'
-            final_confidence = cv_confidence
-        
-        # Generate recommendation
-        if final_prediction == 'Malignant':
-            recommendation = "⚠️ HIGH RISK: Immediate biopsy and specialist consultation required."
-        elif final_prediction == 'Benign':
-            recommendation = "⚡ MEDIUM RISK: Close monitoring with follow-up imaging in 3-6 months."
-        else:
-            if cv_severity > 0.3:
-                recommendation = "✓ LOW-MEDIUM RISK: Routine screening recommended with follow-up."
-            else:
-                recommendation = "✓ LOW RISK: Continue routine annual screening."
+        score = confidence.item()
+        prediction_label = model_config['classes'][class_idx.item()]
 
+        # 6. GRAD-CAM
         heatmap_base64 = None
-
-        # Generate Grad-CAM
         if mode == 'doctor':
             try:
-                target_layer = get_target_layer(loaded_model)
-                if target_layer:
-                    grad_cam = GradCAM(loaded_model, target_layer)
-                    cam_mask = grad_cam(input_tensor, class_idx=class_idx.item())
-                    
-                    if cam_mask is not None:
-                        heatmap_base64 = generate_heatmap_overlay(
-                            img_final, 
-                            cam_mask, 
-                            final_prediction
-                        )
-                    
-                    grad_cam.remove_hooks()
-                    
+                # Target the MoE layer for the best spatial-frequency blended heatmap
+                target_layer = loaded_model.proj2[-1] 
+                cam_tool = DualInputGradCAM(loaded_model, target_layer)
+                heatmap_mask = cam_tool(input_tensor, freq_tensor)
+                if heatmap_mask is not None:
+                    heatmap_base64 = generate_heatmap_overlay(img_cv2, heatmap_mask)
             except Exception as e:
-                print(f"Heatmap generation error: {e}")
+                print(f"GradCAM Error: {e}")
+
+        # 7. CLEAR MEMORY
+        del loaded_model
+        gc.collect()
 
         return jsonify({
-            'result': final_prediction,
-            'confidence': f"{final_confidence:.2f}",
+            'modality_detected': modality_key.capitalize(),
+            'result': prediction_label,
+            'confidence': f"{score:.2f}",
             'heatmap': heatmap_base64,
-            'recommendation': recommendation,
-            'analysis_details': {
-                'ai_prediction': ai_prediction,
-                'ai_confidence': f"{ai_score:.2f}",
-                'cv_prediction': cv_prediction,
-                'cv_severity': f"{cv_severity:.2f}",
-                'suspicious_regions': cv_details.get('suspicious_regions', 0),
-                'override_active': override_active,
-                'certainty_margin': f"{certainty_margin:.2f}",
-                'total_suspicious_area': cv_details.get('total_area', 0),
-                'max_intensity': cv_details.get('max_intensity', 0)
-            }
+            'recommendation': "Consult specialist for detailed diagnosis."
         })
 
     except Exception as e:
-        print(f"Prediction error: {e}")
-        import traceback
-        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 @app.route('/', methods=['GET'])
 def health_check():
-    model_status = "loaded" if loaded_model else "not loaded"
-    return jsonify({
-        'status': 'online',
-        'model': model_status,
-        'classes': detected_classes
-    }), 200
+    return "BreastScan Multi-Model RAM-Net Backend Online", 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=80)
