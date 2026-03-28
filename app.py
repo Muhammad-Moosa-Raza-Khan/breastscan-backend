@@ -96,13 +96,25 @@ def load_pytorch_model(scan_type):
     print(f" * [GATEKEEPER] Loading {scan_type} ({config['num_classes']} classes)…")
 
     try:
-        model = RAMNet(num_classes=config['num_classes'])
-        state_dict = torch.load(path, map_location='cpu', weights_only=False)
+        model      = RAMNet(num_classes=config['num_classes'])
+        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+
+        # ── Handle checkpoint dict vs plain state_dict ──
+        # Saved with torch.save({'model_state_dict': ..., 'epoch': ...}, path)
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+            epoch      = checkpoint.get('epoch', 'N/A')
+            best_acc   = checkpoint.get('best_acc', 'N/A')
+            print(f"   [INFO] Checkpoint — epoch: {epoch}, best_acc: {best_acc}")
+        else:
+            # Plain state_dict saved with torch.save(model.state_dict(), path)
+            state_dict = checkpoint
 
         # Report any key mismatches so you can debug architecture gaps
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         if missing:
             print(f"   [WARN] Missing keys ({len(missing)}): {missing[:5]}")
+            print(f"   *** ACTION NEEDED: Paste your full RAMNet __init__ & forward() into this file ***")
         if unexpected:
             print(f"   [WARN] Unexpected keys ({len(unexpected)}): {unexpected[:5]}")
 
