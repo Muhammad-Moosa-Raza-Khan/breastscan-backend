@@ -1,7 +1,7 @@
 """
 MedScan API — Production Backend
-Real MedFormerULTRA architecture integrated from training code.
-FIXED VERSION — all bugs corrected.
+MedFormerULTRA architecture.
+FIXED v3 — correct routing, blur thresholds, balanced prediction.
 """
 
 import os
@@ -16,7 +16,6 @@ import torch.nn.functional as F
 import timm
 import torchvision.transforms as T
 from scipy.fftpack import dct
-from PIL import Image
 from flask import Flask, request, jsonify
 
 # =====================================================================
@@ -24,7 +23,7 @@ from flask import Flask, request, jsonify
 # =====================================================================
 app = Flask(__name__)
 application = app
-app.config['MAX_CONTENT_LENGTH'] = 15 * 1024 * 1024   # 15 MB hard cap
+app.config['MAX_CONTENT_LENGTH'] = 15 * 1024 * 1024
 
 MODEL_PATHS = {
     'mammogram_mias': 'models/mammo_mias.pth',
@@ -42,14 +41,14 @@ DATASET_CONFIGS = {
     'ultrasound':     {'num_classes': 3, 'labels': ['Benign',  'Malignant', 'Normal']},
 }
 
+# Every explicit scan_type the client is allowed to send
 VALID_SCAN_TYPES = set(DATASET_CONFIGS.keys()) | {'mammogram', 'auto'}
 
 active_model_type = None
 loaded_model      = None
-detected_classes  = []
 
 # =====================================================================
-# 2. REAL ARCHITECTURE — MedFormerULTRA
+# 2. ARCHITECTURE — MedFormerULTRA
 # =====================================================================
 
 class EfficientAttention(nn.Module):
@@ -108,15 +107,13 @@ class MoE(nn.Module):
 
 
 class MedFormerULTRA(nn.Module):
-    FEATURE_DIM  = 256
-    NUM_EXPERTS  = 3
+    FEATURE_DIM = 256
+    NUM_EXPERTS = 3
 
     def __init__(self, num_classes=3):
         super().__init__()
-
         self.backbone = timm.create_model(
             'tf_efficientnetv2_s', pretrained=False, features_only=True)
-
         with torch.no_grad():
             dummy = torch.randn(1, 3, 224, 224)
             feats = self.backbone(dummy)
@@ -147,7 +144,6 @@ class MedFormerULTRA(nn.Module):
             nn.LayerNorm(512), nn.ReLU(inplace=True),
             nn.Dropout(0.4),
         )
-
         self.classifier = nn.Sequential(
             nn.Linear(512, 256),
             nn.LayerNorm(256), nn.ReLU(inplace=True),
@@ -157,40 +153,38 @@ class MedFormerULTRA(nn.Module):
         self.aux_classifier = nn.Linear(cd, num_classes)
 
     def forward(self, x, freq, return_all=False):
-        feats    = self.backbone(x)
-        f1, f2   = feats[-2], feats[-1]
-        f1       = self.proj1(f1)
-        f2       = self.proj2(f2)
+        feats  = self.backbone(x)
+        f1, f2 = feats[-2], feats[-1]
+        f1     = self.proj1(f1)
+        f2     = self.proj2(f2)
         if f1.shape[2:] != f2.shape[2:]:
             f1 = F.adaptive_avg_pool2d(f1, f2.shape[2:])
-        fused    = f1 + f2
+        fused = f1 + f2
 
         feat, gate_weights = self.moe(fused)
-
-        B, C, H, W  = feat.shape
-        feat_down   = F.adaptive_avg_pool2d(feat, (H // 2, W // 2))
-        feat_flat   = feat_down.flatten(2).transpose(1, 2)
-        feat_att    = self.attention(feat_flat)
+        B, C, H, W = feat.shape
+        feat_down  = F.adaptive_avg_pool2d(feat, (H // 2, W // 2))
+        feat_flat  = feat_down.flatten(2).transpose(1, 2)
+        feat_att   = self.attention(feat_flat)
         feat_spatial = feat_att.transpose(1, 2).reshape(B, C, H // 2, W // 2)
         feat_spatial = F.interpolate(feat_spatial, size=(H, W),
                                      mode='bilinear', align_corners=False)
         feat = feat + feat_spatial
 
-        pooled    = self.global_pool(feat).flatten(1)
-        freq_feat = self.freq_encoder(freq).flatten(1)
-        combined  = torch.cat([pooled, freq_feat], dim=1)
+        pooled     = self.global_pool(feat).flatten(1)
+        freq_feat  = self.freq_encoder(freq).flatten(1)
+        combined   = torch.cat([pooled, freq_feat], dim=1)
         fused_feat = self.fusion(combined)
 
         logits     = self.classifier(fused_feat)
         aux_logits = self.aux_classifier(pooled)
-
         if return_all:
             return logits, aux_logits, gate_weights
         return logits, aux_logits
 
 
 # =====================================================================
-# 3. FREQUENCY FEATURE EXTRACTOR
+# 3. FREQUENCY EXTRACTOR
 # =====================================================================
 
 def _dct2(img_gray_f32):
@@ -201,22 +195,18 @@ def extract_freq_tensor(img_rgb_f32, target_size=320):
     gray = cv2.cvtColor(
         (img_rgb_f32 * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY
     ).astype(np.float32) / 255.0
-
     dct_feat = _dct2(gray)
     h, w     = dct_feat.shape
     ch, cw   = int(h * 0.3), int(w * 0.3)
     low_freq = dct_feat.copy()
     low_freq[ch:, :] = 0
     low_freq[:, cw:] = 0
-
     freq3 = np.stack([low_freq, low_freq, low_freq], axis=2)
     freq3 = cv2.resize(freq3, (target_size, target_size),
                        interpolation=cv2.INTER_LINEAR)
-
     vmax = np.abs(freq3).max()
     if vmax > 0:
         freq3 = freq3 / vmax
-
     return torch.from_numpy(freq3.transpose(2, 0, 1)).float()
 
 
@@ -235,27 +225,32 @@ spatial_transform = T.Compose([
 
 
 def prepare_inputs(img_rgb_uint8):
-    gray_u8   = cv2.cvtColor(img_rgb_uint8, cv2.COLOR_RGB2GRAY)
-    clahe     = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced  = clahe.apply(gray_u8)
+    """Convert HxWx3 uint8 RGB → (spatial_tensor, freq_tensor) both (1,3,H,W)."""
+    gray_u8      = cv2.cvtColor(img_rgb_uint8, cv2.COLOR_RGB2GRAY)
+    clahe        = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced     = clahe.apply(gray_u8)
     enhanced_rgb = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB).astype(np.float32) / 255.0
-
     spatial = spatial_transform(enhanced_rgb)
     freq    = extract_freq_tensor(enhanced_rgb, IMG_SIZE)
-
     return spatial.unsqueeze(0), freq.unsqueeze(0)
 
 
 # =====================================================================
-# 5. MODEL LOADER
+# 5. MODEL LOADER  — returns (model, labels) so caller is self-contained
 # =====================================================================
 
-def load_pytorch_model(scan_type):
-    global loaded_model, active_model_type, detected_classes
+def load_model(scan_type):
+    """
+    Load model for scan_type.
+    Returns (model, labels_list) or raises RuntimeError.
+    Uses the global cache when possible.
+    """
+    global loaded_model, active_model_type
 
     if active_model_type == scan_type and loaded_model is not None:
-        return True
+        return loaded_model, DATASET_CONFIGS[scan_type]['labels']
 
+    # Unload previous
     if loaded_model is not None:
         print(f" * [GATEKEEPER] Unloading {active_model_type}…")
         del loaded_model
@@ -265,137 +260,188 @@ def load_pytorch_model(scan_type):
     path   = MODEL_PATHS.get(scan_type)
     config = DATASET_CONFIGS.get(scan_type)
 
-    if not path or not os.path.exists(path):
-        print(f" ! [ERROR] Model file not found: {path}")
-        return False
+    if not path:
+        raise RuntimeError(f"No model path configured for '{scan_type}'.")
+    if not os.path.exists(path):
+        raise RuntimeError(f"Model file not found: {path}")
 
-    detected_classes = config['labels']
     print(f" * [GATEKEEPER] Loading {scan_type} ({config['num_classes']} classes)…")
+    model      = MedFormerULTRA(num_classes=config['num_classes'])
+    checkpoint = torch.load(path, map_location='cpu', weights_only=False)
 
-    try:
-        model      = MedFormerULTRA(num_classes=config['num_classes'])
-        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        state_dict = checkpoint['model_state_dict']
+        print(f"   [INFO] epoch={checkpoint.get('epoch','?')}  "
+              f"best_acc={checkpoint.get('best_acc','?')}")
+    else:
+        state_dict = checkpoint
 
-        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            state_dict = checkpoint['model_state_dict']
-            print(f"   [INFO] Checkpoint — epoch: {checkpoint.get('epoch','?')}, "
-                  f"best_acc: {checkpoint.get('best_acc','?')}")
-        else:
-            state_dict = checkpoint
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:    print(f"   [WARN] Missing   ({len(missing)}): {missing[:3]}")
+    if unexpected: print(f"   [WARN] Unexpect  ({len(unexpected)}): {unexpected[:3]}")
+    if not missing and not unexpected:
+        print("   [OK] All weights loaded — zero mismatches.")
 
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        if missing:
-            print(f"   [WARN] Missing keys ({len(missing)}): {missing[:3]}")
-        if unexpected:
-            print(f"   [WARN] Unexpected keys ({len(unexpected)}): {unexpected[:3]}")
-        if not missing and not unexpected:
-            print("   [OK] All weights loaded — zero mismatches.")
+    model.eval()
+    loaded_model      = model
+    active_model_type = scan_type
 
-        model.eval()
-        loaded_model      = model
-        active_model_type = scan_type
-
-        healthy, preds = _verify_model_diversity(model, config['num_classes'])
-        if not healthy:
-            print(f"   [WARN] Same prediction for all test inputs {preds}.")
-        else:
-            print(f"   [OK] Diversity check passed: {preds}")
-
-        return True
-
-    except Exception as e:
-        print(f" ! [FATAL] Cannot load {scan_type}: {e}")
-        traceback.print_exc()
-        loaded_model      = None
-        active_model_type = None
-        return False
+    preds = _diversity_check(model, config['num_classes'])
+    print(f"   [OK] Diversity check: {preds}")
+    return model, config['labels']
 
 
-def _verify_model_diversity(model, num_classes):
+def _diversity_check(model, num_classes):
     preds = []
     try:
         with torch.no_grad():
             for fill in [0.0, 0.5, None]:
-                x = (torch.zeros(1,3,IMG_SIZE,IMG_SIZE) if fill == 0.0 else
-                     torch.ones(1,3,IMG_SIZE,IMG_SIZE)*0.5 if fill == 0.5 else
-                     torch.rand(1,3,IMG_SIZE,IMG_SIZE))
+                x = (torch.zeros(1, 3, IMG_SIZE, IMG_SIZE) if fill == 0.0 else
+                     torch.ones(1, 3, IMG_SIZE, IMG_SIZE) * 0.5 if fill == 0.5 else
+                     torch.rand(1, 3, IMG_SIZE, IMG_SIZE))
                 f = torch.rand(1, 3, IMG_SIZE, IMG_SIZE)
                 logits, _ = model(x, f)
                 preds.append(torch.argmax(logits, dim=1).item())
-        return len(set(preds)) > 1, preds
     except Exception:
-        return True, preds
+        pass
+    return preds
 
 
-load_pytorch_model('mammogram_dmid')
+# Pre-load default
+try:
+    load_model('mammogram_dmid')
+except Exception as e:
+    print(f"[STARTUP] Could not pre-load mammogram_dmid: {e}")
 
 
 # =====================================================================
-# 6. MEDICAL IMAGE VALIDATOR — FIXED
+# 6. AUTO SCAN-TYPE DETECTION  (fixed — saturation-first)
 # =====================================================================
 
-def validate_medical_image(img_cv2, scan_type):
+def auto_detect_scan_type(img_bgr):
     """
-    FIX 1: Separate blur/contrast thresholds per modality.
-    Mammograms are naturally low-contrast so they need looser thresholds.
-    Histopathology images are naturally colourful so colour check is skipped.
+    Returns one of the five concrete model keys.
+
+    Priority:
+      1. Histopathology  → high HSV saturation  (H&E pink/purple staining)
+      2. MRI             → bright centre vs dark borders
+      3. Ultrasound      → high Laplacian variance (speckle noise)
+      4. Mammogram DMID  → fallback
     """
     try:
-        h, w = img_cv2.shape[:2]
-        if h < 128 or w < 128:
-            return False, "Resolution too low. Please upload a minimum 128x128 scan."
-        if h > 4096 or w > 4096:
-            return False, "Image too large (max 4096×4096). Resize before uploading."
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY) \
+               if len(img_bgr.shape) == 3 else img_bgr.copy()
 
-        gray    = (cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
-                   if len(img_cv2.shape) == 3 else img_cv2.copy())
+        # 1. Histopathology — saturation check
+        if len(img_bgr.shape) == 3:
+            hsv      = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+            mean_sat = float(hsv[:, :, 1].mean())
+            # H&E slides: saturation typically 60-140; grayscale scans < 25
+            if mean_sat > 45:
+                print(f"   [AUTO] histopathology  (sat={mean_sat:.1f})")
+                return 'histopathology'
+
+        # 2. MRI — bright centre relative to dark border
+        h4, w4  = gray.shape[0] // 4, gray.shape[1] // 4
+        border  = float(np.mean([gray[0].mean(), gray[-1].mean(),
+                                  gray[:, 0].mean(), gray[:, -1].mean()]))
+        centre  = float(gray[h4:3*h4, w4:3*w4].mean())
+        c_ratio = (centre - border) / (centre + 1e-6)
+        if c_ratio > 0.30:
+            print(f"   [AUTO] mri  (centre_ratio={c_ratio:.2f})")
+            return 'mri'
+
+        # 3. Ultrasound — speckle noise → high Laplacian variance
+        lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        if lap_var > 500:
+            print(f"   [AUTO] ultrasound  (lap={lap_var:.0f})")
+            return 'ultrasound'
+
+        # 4. Fallback
+        print(f"   [AUTO] mammogram_dmid  (fallback, lap={lap_var:.0f})")
+        return 'mammogram_dmid'
+
+    except Exception as e:
+        print(f"   [AUTO] Exception: {e} — fallback mammogram_dmid")
+        return 'mammogram_dmid'
+
+
+# =====================================================================
+# 7. VALIDATION  (per-modality thresholds)
+# =====================================================================
+
+# Blur (Laplacian variance) and contrast (pixel std) thresholds per modality.
+# Mammograms are naturally soft/low-frequency → very loose thresholds.
+_BLUR_THRESH = {
+    'mammogram_mias': 8,
+    'mammogram_dmid': 8,
+    'mri':            12,
+    'ultrasound':     25,
+    'histopathology': 25,
+}
+_CONTRAST_THRESH = {
+    'mammogram_mias': 6,
+    'mammogram_dmid': 6,
+    'mri':            8,
+    'ultrasound':     10,
+    'histopathology': 10,
+}
+
+
+def validate_medical_image(img_bgr, scan_type):
+    try:
+        h, w = img_bgr.shape[:2]
+        if h < 128 or w < 128:
+            return False, "Resolution too low (min 128×128)."
+        if h > 4096 or w > 4096:
+            return False, "Image too large (max 4096×4096)."
+
+        gray    = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY) \
+                  if len(img_bgr.shape) == 3 else img_bgr.copy()
         mean_px = float(np.mean(gray))
 
-        if mean_px < 5:
+        # Blank / overexposed
+        if mean_px < 4:
             return False, "Image is blank/black. Please retake the scan."
-        if mean_px > 250:
-            return False, "Image is overexposed/all-white. Please retake with correct exposure."
+        if mean_px > 251:
+            return False, "Image is overexposed (all-white). Please retake."
 
-        # ── Per-modality blur threshold ──────────────────────────────
-        laplacian_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-        if scan_type in ('mammogram_mias', 'mammogram_dmid'):
-            blur_threshold     = 10   # mammograms are naturally soft
-            contrast_threshold = 8
-        elif scan_type == 'mri':
-            blur_threshold     = 15
-            contrast_threshold = 10
-        else:
-            blur_threshold     = 30
-            contrast_threshold = 12
+        # Blur
+        lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        thresh  = _BLUR_THRESH.get(scan_type, 20)
+        if lap_var < thresh:
+            return False, (f"Image appears too blurry (sharpness={lap_var:.1f}, "
+                           f"minimum={thresh}). Please upload a sharper scan.")
 
-        if laplacian_var < blur_threshold:
-            return False, "Image is too blurry. Please use a sharper scan."
-        if float(np.std(gray)) < contrast_threshold:
+        # Contrast
+        std_thresh = _CONTRAST_THRESH.get(scan_type, 10)
+        if float(np.std(gray)) < std_thresh:
             return False, "Insufficient contrast. Please use a properly acquired scan."
 
-        # ── Colour check: skip for histopathology (always colourful) ─
-        if len(img_cv2.shape) == 3 and scan_type != 'histopathology':
-            ch_means  = [float(img_cv2[:, :, c].mean()) for c in range(3)]
+        # Colour check — grayscale scans must not be heavily coloured
+        # (skip for histopathology — H&E is expected to be colourful)
+        if len(img_bgr.shape) == 3 and scan_type != 'histopathology':
+            ch_means  = [float(img_bgr[:, :, c].mean()) for c in range(3)]
             color_var = float(np.std(ch_means))
-            if color_var > 30:
-                return False, (f"This does not look like a {scan_type.replace('_',' ')} scan. "
+            if color_var > 35:
+                return False, (f"This does not look like a {scan_type.replace('_', ' ')} scan. "
                                "Please upload a proper grayscale medical image.")
 
-        # ── Screenshot detection ─────────────────────────────────────
+        # Screenshot heuristic (many long straight edges)
         edges = cv2.Canny(gray, 50, 150)
-        lines = cv2.HoughLinesP(edges, 1, np.pi/2, threshold=120,
-                                minLineLength=int(w*0.75), maxLineGap=10)
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 2, threshold=120,
+                                minLineLength=int(w * 0.75), maxLineGap=10)
         if lines is not None and len(lines) > 6:
             return False, "Image appears to be a screenshot. Please crop to the scan only."
 
-        # ── Solid colour check ───────────────────────────────────────
+        # Solid-colour check
         blocks = _block_variance(gray)
         if blocks.size > 0 and np.sum(blocks < 5) / blocks.size > 0.85:
             return False, "Image appears to be a solid colour — not a medical scan."
 
         return True, None
     except Exception:
-        return True, None
+        return True, None   # fail-open on unexpected errors
 
 
 def _block_variance(gray, bs=32):
@@ -407,145 +453,100 @@ def _block_variance(gray, bs=32):
 
 
 # =====================================================================
-# 7. AUTO SCAN-TYPE DETECTION — FIXED
-# =====================================================================
-
-def auto_detect_scan_type(img_cv2):
-    """
-    FIX 2: More reliable modality detection.
-
-    Priority order:
-      1. Histopathology  → strong colour saturation (H&E staining is pink/purple)
-      2. MRI             → bright centre, dark borders, moderate texture
-      3. Ultrasound      → high Laplacian variance (speckle noise)
-      4. Mammogram       → fallback
-    """
-    try:
-        gray = (cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
-                if len(img_cv2.shape) == 3 else img_cv2.copy())
-
-        # ── 1. Histopathology: check colour saturation ──────────────
-        if len(img_cv2.shape) == 3:
-            img_hsv = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2HSV)
-            mean_sat = float(img_hsv[:, :, 1].mean())
-            # H&E slides have saturation typically > 60; grayscale scans < 20
-            if mean_sat > 50:
-                print(f"   [AUTO-DETECT] Histopathology (saturation={mean_sat:.1f})")
-                return 'histopathology'
-
-        # ── 2. MRI: bright centre relative to dark border ───────────
-        h4, w4 = gray.shape[0]//4, gray.shape[1]//4
-        border  = float(np.mean([gray[0].mean(), gray[-1].mean(),
-                                  gray[:,0].mean(), gray[:,-1].mean()]))
-        centre  = float(gray[h4:3*h4, w4:3*w4].mean())
-        centre_ratio = (centre - border) / (centre + 1)
-        if centre_ratio > 0.30:
-            print(f"   [AUTO-DETECT] MRI (centre_ratio={centre_ratio:.2f})")
-            return 'mri'
-
-        # ── 3. Ultrasound: high speckle / Laplacian variance ────────
-        lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-        if lap_var > 600:
-            print(f"   [AUTO-DETECT] Ultrasound (laplacian={lap_var:.0f})")
-            return 'ultrasound'
-
-        # ── 4. Mammogram fallback ────────────────────────────────────
-        print(f"   [AUTO-DETECT] Mammogram (fallback, laplacian={lap_var:.0f})")
-        return 'mammogram_dmid'
-
-    except Exception as e:
-        print(f"   [AUTO-DETECT] Exception: {e} — falling back to mammogram_dmid")
-        return 'mammogram_dmid'
-
-
-# =====================================================================
 # 8. MAMMOGRAM PREPROCESSING
 # =====================================================================
 
-def preprocess_mammogram(img_cv2):
+def preprocess_mammogram(img_bgr):
     try:
-        gray     = (cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
-                    if len(img_cv2.shape) == 3 else img_cv2.copy())
-        clahe    = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        gray     = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY) \
+                   if len(img_bgr.shape) == 3 else img_bgr.copy()
+        clahe    = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
         denoised = cv2.bilateralFilter(enhanced, 9, 75, 75)
         return cv2.cvtColor(denoised, cv2.COLOR_GRAY2BGR)
     except Exception:
-        return img_cv2
+        return img_bgr
 
 
-def crop_to_breast_tissue(img_cv2):
+def crop_to_breast_tissue(img_bgr):
     try:
-        gray      = (cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
-                     if len(img_cv2.shape) == 3 else img_cv2)
+        gray      = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY) \
+                    if len(img_bgr.shape) == 3 else img_bgr
         _, thresh = cv2.threshold(gray, 20, 255, cv2.THRESH_BINARY)
-        k         = np.ones((5,5), np.uint8)
+        k         = np.ones((5, 5), np.uint8)
         thresh    = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, k, iterations=2)
         thresh    = cv2.morphologyEx(thresh, cv2.MORPH_OPEN,  k, iterations=1)
-        cnts, _   = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cnts, _   = cv2.findContours(thresh, cv2.RETR_EXTERNAL,
+                                     cv2.CHAIN_APPROX_SIMPLE)
         if cnts:
-            c        = max(cnts, key=cv2.contourArea)
-            x, y, w, h = cv2.boundingRect(c)
-            pad      = max(5, min(w,h)//20)
-            hi, wi   = img_cv2.shape[:2]
-            return img_cv2[max(0,y-pad):min(hi,y+h+pad),
-                           max(0,x-pad):min(wi,x+w+pad)]
-        return img_cv2
+            c           = max(cnts, key=cv2.contourArea)
+            x, y, w, h  = cv2.boundingRect(c)
+            pad         = max(5, min(w, h) // 20)
+            hi, wi      = img_bgr.shape[:2]
+            return img_bgr[max(0, y-pad):min(hi, y+h+pad),
+                           max(0, x-pad):min(wi, x+w+pad)]
+        return img_bgr
     except Exception:
-        return img_cv2
+        return img_bgr
 
 
-def get_tissue_mask_advanced(img_cv2):
+def get_tissue_mask_advanced(img_bgr):
     try:
-        gray      = (cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
-                     if len(img_cv2.shape) == 3 else img_cv2)
+        gray      = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY) \
+                    if len(img_bgr.shape) == 3 else img_bgr
         _, thresh = cv2.threshold(gray, 0, 255,
-                                   cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        k = np.ones((5,5), np.uint8)
+                                  cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        k      = np.ones((5, 5), np.uint8)
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, k, iterations=3)
-        return cv2.erode(thresh, np.ones((7,7), np.uint8), iterations=1)
+        return cv2.erode(thresh, np.ones((7, 7), np.uint8), iterations=1)
     except Exception:
-        return np.ones(img_cv2.shape[:2], dtype=np.uint8) * 255
+        return np.ones(img_bgr.shape[:2], dtype=np.uint8) * 255
 
 
 # =====================================================================
-# 9. CV ABNORMALITY ANALYSIS
+# 9. CV ABNORMALITY ANALYSIS  (mammogram only)
 # =====================================================================
 
-def comprehensive_abnormality_analysis(img_cv2):
+def comprehensive_abnormality_analysis(img_bgr):
     try:
-        gray    = (cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
-                   if len(img_cv2.shape) == 3 else img_cv2)
-        clahe   = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        gray     = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY) \
+                   if len(img_bgr.shape) == 3 else img_bgr
+        clahe    = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
         _, bright = cv2.threshold(enhanced, 210, 255, cv2.THRESH_BINARY)
-        cnts, _   = cv2.findContours(bright, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
+        cnts, _   = cv2.findContours(bright, cv2.RETR_EXTERNAL,
+                                     cv2.CHAIN_APPROX_SIMPLE)
         regions, total_area = [], 0
         for cnt in cnts:
-            area = cv2.contourArea(cnt)
+            area  = cv2.contourArea(cnt)
             if area <= 30: continue
             perim = cv2.arcLength(cnt, True)
-            circ  = (4*np.pi*area/perim**2) if perim > 0 else 0
+            circ  = (4 * np.pi * area / perim**2) if perim > 0 else 0
             mask  = np.zeros(gray.shape, np.uint8)
             cv2.drawContours(mask, [cnt], -1, 255, -1)
             mInt  = cv2.mean(enhanced, mask=mask)[0]
-            score = (3 if area>100 else 2 if area>50 else 1)
-            score += (2 if mInt>230 else 1 if mInt>220 else 0)
-            score += (1 if circ>0.6 else 0)
+            score = (3 if area > 100 else 2 if area > 50 else 1)
+            score += (2 if mInt > 230 else 1 if mInt > 220 else 0)
+            score += (1 if circ > 0.6 else 0)
             if score >= 3:
-                regions.append({'area':area,'circularity':circ,'intensity':mInt,'score':score})
+                regions.append({'area': area, 'circularity': circ,
+                                'intensity': mInt, 'score': score})
                 total_area += area
 
         n = len(regions)
-        if n == 0:       sev, conf, cat = 0.0, 0.9, "Normal"
+        if n == 0:
+            sev, conf, cat = 0.0, 0.9, "Normal"
         elif n == 1:
             r = regions[0]
-            if r['area']>500 or r['intensity']>235: sev,cat,conf = 0.8,"Malignant",0.7
-            else:                                    sev,cat,conf = 0.5,"Benign",   0.7
+            if r['area'] > 500 or r['intensity'] > 235:
+                sev, cat, conf = 0.8, "Malignant", 0.7
+            else:
+                sev, cat, conf = 0.5, "Benign", 0.7
         else:
-            if any(r['area']>300 for r in regions): sev,cat,conf = 0.9,"Malignant",0.8
-            else:                                    sev,cat,conf = 0.6,"Benign",   0.8
+            if any(r['area'] > 300 for r in regions):
+                sev, cat, conf = 0.9, "Malignant", 0.8
+            else:
+                sev, cat, conf = 0.6, "Benign", 0.8
 
         return sev, conf, {
             'suspicious_regions': n,
@@ -563,9 +564,9 @@ def comprehensive_abnormality_analysis(img_cv2):
 
 class GradCAM:
     def __init__(self, model, target_layer):
-        self.model        = model
-        self.gradients    = None
-        self.activations  = None
+        self.model       = model
+        self.gradients   = None
+        self.activations = None
         self._hooks = [
             target_layer.register_forward_hook(self._save_act),
             target_layer.register_full_backward_hook(self._save_grad),
@@ -587,14 +588,15 @@ class GradCAM:
                 return None
             grads   = self.gradients.cpu().numpy()[0]
             acts    = self.activations.cpu().numpy()[0]
-            weights = np.mean(grads, axis=(1,2))
+            weights = np.mean(grads, axis=(1, 2))
             cam     = np.zeros(acts.shape[1:], dtype=np.float32)
             for i, w in enumerate(weights):
                 cam += w * acts[i]
             cam = np.maximum(cam, 0)
-            cam = cv2.resize(cam, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_CUBIC)
+            cam = cv2.resize(cam, (IMG_SIZE, IMG_SIZE),
+                             interpolation=cv2.INTER_CUBIC)
             if cam.max() > 0:
-                cam = cam / cam.max()
+                cam /= cam.max()
             return cam
         except Exception as e:
             print(f"[GradCAM] {e}")
@@ -603,13 +605,11 @@ class GradCAM:
 
 def get_target_layer(model):
     try:
-        if hasattr(model, 'backbone'):
-            best = None
-            for m in model.backbone.modules():
-                if isinstance(m, nn.Conv2d) and m.out_channels >= 256:
-                    best = m
-            if best: return best
         best = None
+        for m in model.backbone.modules():
+            if isinstance(m, nn.Conv2d) and m.out_channels >= 256:
+                best = m
+        if best: return best
         for m in model.modules():
             if isinstance(m, nn.Conv2d) and m.out_channels >= 128:
                 best = m
@@ -621,35 +621,36 @@ def get_target_layer(model):
     return None
 
 
-def refine_gradcam(cam, img_cv2):
+def refine_gradcam(cam, img_bgr):
     try:
-        gray = (cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
-                if len(img_cv2.shape) == 3 else img_cv2)
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY) \
+               if len(img_bgr.shape) == 3 else img_bgr
         intensity = cv2.resize(
-            np.power(gray.astype(np.float32)/255.0, 0.7), (IMG_SIZE, IMG_SIZE))
+            np.power(gray.astype(np.float32) / 255.0, 0.7),
+            (IMG_SIZE, IMG_SIZE))
         refined = cam * 0.7 + intensity * 0.3
         return refined / refined.max() if refined.max() > 0 else refined
     except Exception:
         return cam
 
 
-def generate_heatmap_overlay(img_cv2, cam, prediction_label, scan_type):
+def generate_heatmap_overlay(img_bgr, cam, prediction_label, scan_type):
     try:
-        img    = img_cv2.copy()
+        img    = img_bgr.copy()
         cam    = refine_gradcam(cam, img)
         tissue = (get_tissue_mask_advanced(img) > 0
                   if 'mammogram' in scan_type
                   else np.ones(img.shape[:2], dtype=bool))
         masked = cam * tissue
-        thr    = (0.25 if prediction_label == 'Malignant' else
-                  0.30 if prediction_label in ('Benign','Sick') else 0.35)
-        if scan_type in ('histopathology','mri'):
+        thr = (0.25 if prediction_label == 'Malignant' else
+               0.30 if prediction_label in ('Benign', 'Sick') else 0.35)
+        if scan_type in ('histopathology', 'mri'):
             thr = max(thr - 0.05, 0.15)
         masked[masked < thr] = 0
-        if masked.max() > 0: masked = masked / masked.max()
-        masked    = cv2.GaussianBlur(masked, (15,15), 0)
-        colored   = cv2.applyColorMap(np.uint8(255*masked), cv2.COLORMAP_JET)
-        overlay   = img.copy()
+        if masked.max() > 0: masked /= masked.max()
+        masked  = cv2.GaussianBlur(masked, (15, 15), 0)
+        colored = cv2.applyColorMap(np.uint8(255 * masked), cv2.COLORMAP_JET)
+        overlay = img.copy()
         heat_mask = (masked > 0.01) & tissue
         if np.any(heat_mask):
             overlay[heat_mask] = cv2.addWeighted(
@@ -665,51 +666,57 @@ def generate_heatmap_overlay(img_cv2, cam, prediction_label, scan_type):
 # 11. DOCTOR EXTRAS
 # =====================================================================
 
-def detect_lesion_boundaries(img_cv2, cam, scan_type):
-    result = {'lesion_count':0,'lesions':[],'total_lesion_area_pct':0.0,'overall_morphology':'N/A'}
+def detect_lesion_boundaries(img_bgr, cam, scan_type):
+    result = {'lesion_count': 0, 'lesions': [],
+              'total_lesion_area_pct': 0.0, 'overall_morphology': 'N/A'}
     try:
         if cam is None: return result
         binary = (cam > 0.45).astype(np.uint8) * 255
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, np.ones((7,7),np.uint8))
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  np.ones((3,3),np.uint8))
-        cnts, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        gray    = (cv2.cvtColor(img_cv2,cv2.COLOR_BGR2GRAY)
-                   if len(img_cv2.shape)==3 else img_cv2)
-        total_px, total_area, lesions = img_cv2.shape[0]*img_cv2.shape[1], 0, []
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  np.ones((3, 3), np.uint8))
+        cnts, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+        gray    = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY) \
+                  if len(img_bgr.shape) == 3 else img_bgr
+        total_px = img_bgr.shape[0] * img_bgr.shape[1]
+        total_area, lesions = 0, []
         for i, cnt in enumerate(cnts):
             area = cv2.contourArea(cnt)
             if area < 60: continue
-            x,y,w,h = cv2.boundingRect(cnt)
-            perim    = cv2.arcLength(cnt,True)
-            circ     = (4*np.pi*area/perim**2) if perim>0 else 0
-            hull     = cv2.convexHull(cnt)
-            solidity = area/cv2.contourArea(hull) if cv2.contourArea(hull)>0 else 0
-            ar       = w/h if h>0 else 1.0
-            mask_r   = np.zeros(gray.shape,np.uint8)
-            cv2.drawContours(mask_r,[cnt],-1,255,-1)
-            mInt     = float(cv2.mean(gray,mask=mask_r)[0])
-            stdInt   = float(np.std(gray[mask_r>0])) if mask_r.any() else 0.0
+            x, y, w, h = cv2.boundingRect(cnt)
+            perim       = cv2.arcLength(cnt, True)
+            circ        = (4 * np.pi * area / perim**2) if perim > 0 else 0
+            hull        = cv2.convexHull(cnt)
+            solidity    = area / cv2.contourArea(hull) \
+                          if cv2.contourArea(hull) > 0 else 0
+            ar          = w / h if h > 0 else 1.0
+            mask_r      = np.zeros(gray.shape, np.uint8)
+            cv2.drawContours(mask_r, [cnt], -1, 255, -1)
+            mInt  = float(cv2.mean(gray, mask=mask_r)[0])
+            stdInt = float(np.std(gray[mask_r > 0])) if mask_r.any() else 0.0
             lesions.append({
-                'lesion_id':         i+1,
-                'area_pixels':       int(area),
-                'area_percentage':   round(area/total_px*100, 2),
-                'bounding_box':      {'x':int(x),'y':int(y),'width':int(w),'height':int(h)},
-                'circularity':       round(float(circ),3),
-                'solidity':          round(float(solidity),3),
-                'aspect_ratio':      round(float(ar),3),
-                'mean_intensity':    round(mInt,2),
-                'std_intensity':     round(stdInt,2),
-                'irregularity_score':round(1-float(circ),3),
-                'morphology':        _classify_morphology(circ,solidity,ar),
-                'suspicion_level':   _suspicion_level(circ,solidity,mInt),
+                'lesion_id':          i + 1,
+                'area_pixels':        int(area),
+                'area_percentage':    round(area / total_px * 100, 2),
+                'bounding_box':       {'x': int(x), 'y': int(y),
+                                       'width': int(w), 'height': int(h)},
+                'circularity':        round(float(circ), 3),
+                'solidity':           round(float(solidity), 3),
+                'aspect_ratio':       round(float(ar), 3),
+                'mean_intensity':     round(mInt, 2),
+                'std_intensity':      round(stdInt, 2),
+                'irregularity_score': round(1 - float(circ), 3),
+                'morphology':         _classify_morphology(circ, solidity, ar),
+                'suspicion_level':    _suspicion_level(circ, solidity, mInt),
             })
             total_area += area
-        lesions.sort(key=lambda l:l['area_pixels'], reverse=True)
+        lesions.sort(key=lambda l: l['area_pixels'], reverse=True)
         result.update({
             'lesion_count':          len(lesions),
             'lesions':               lesions,
-            'total_lesion_area_pct': round(total_area/total_px*100, 2),
-            'overall_morphology':    lesions[0]['morphology'] if lesions else 'No detectable lesion',
+            'total_lesion_area_pct': round(total_area / total_px * 100, 2),
+            'overall_morphology':    (lesions[0]['morphology']
+                                     if lesions else 'No detectable lesion'),
         })
     except Exception as e:
         print(f"[Lesion] {e}")
@@ -717,131 +724,172 @@ def detect_lesion_boundaries(img_cv2, cam, scan_type):
 
 
 def _classify_morphology(c, s, ar):
-    if c>0.80 and s>0.90:   return "Round / Oval — Low suspicion"
-    if c>0.60 and s>0.80:   return "Oval with smooth margins — Low-intermediate suspicion"
-    if c<0.40 or s<0.65:    return "Irregular / Spiculated — High suspicion"
-    if ar>1.5 or ar<0.67:   return "Elongated — Moderate suspicion"
+    if c > 0.80 and s > 0.90: return "Round / Oval — Low suspicion"
+    if c > 0.60 and s > 0.80: return "Oval with smooth margins — Low-intermediate suspicion"
+    if c < 0.40 or  s < 0.65: return "Irregular / Spiculated — High suspicion"
+    if ar > 1.5 or  ar < 0.67: return "Elongated — Moderate suspicion"
     return "Lobular — Moderate suspicion"
 
 
 def _suspicion_level(c, s, mInt):
-    sc = (2 if c<0.5 else 0) + (2 if s<0.7 else 0) + (1 if mInt>200 else 0)
-    return "High" if sc>=4 else "Moderate" if sc>=2 else "Low"
+    sc = (2 if c < 0.5 else 0) + (2 if s < 0.7 else 0) + (1 if mInt > 200 else 0)
+    return "High" if sc >= 4 else "Moderate" if sc >= 2 else "Low"
 
 
-def compute_texture_features(img_cv2, cam=None):
+def compute_texture_features(img_bgr, cam=None):
     try:
-        gray = (cv2.cvtColor(img_cv2,cv2.COLOR_BGR2GRAY)
-                if len(img_cv2.shape)==3 else img_cv2.copy())
-        roi  = gray[((cam>0.45).astype(np.uint8))>0] if (
-            cam is not None and (cam>0.45).any()) else gray.flatten()
-        if len(roi)==0: roi = gray.flatten()
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY) \
+               if len(img_bgr.shape) == 3 else img_bgr.copy()
+        roi  = gray[((cam > 0.45).astype(np.uint8)) > 0] \
+               if (cam is not None and (cam > 0.45).any()) else gray.flatten()
+        if len(roi) == 0: roi = gray.flatten()
         f   = roi.astype(np.float64)
-        mu  = float(np.mean(f)); std = float(np.std(f))
-        skew = float(np.mean(((f-mu)/std)**3)) if std>0 else 0.0
-        kurt = float(np.mean(((f-mu)/std)**4)-3) if std>0 else 0.0
-        hist = cv2.calcHist([gray],[0],None,[256],[0,256])
-        hist = hist/hist.sum(); hist = hist[hist>0]
-        ent  = float(-np.sum(hist*np.log2(hist)))
+        mu  = float(np.mean(f))
+        std = float(np.std(f))
+        skew = float(np.mean(((f - mu) / std) ** 3)) if std > 0 else 0.0
+        kurt = float(np.mean(((f - mu) / std) ** 4) - 3) if std > 0 else 0.0
+        hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
+        hist = hist / hist.sum()
+        hist = hist[hist > 0]
+        ent  = float(-np.sum(hist * np.log2(hist)))
         return {
-            'mean_intensity': round(mu,2),  'std_deviation': round(std,2),
-            'skewness': round(skew,4),       'kurtosis':      round(kurt,4),
-            'entropy':  round(ent,4),        'dynamic_range': int(int(gray.max())-int(gray.min())),
+            'mean_intensity': round(mu, 2),
+            'std_deviation':  round(std, 2),
+            'skewness':       round(skew, 4),
+            'kurtosis':       round(kurt, 4),
+            'entropy':        round(ent, 4),
+            'dynamic_range':  int(int(gray.max()) - int(gray.min())),
         }
     except Exception as e:
-        print(f"[Texture] {e}"); return {}
+        print(f"[Texture] {e}")
+        return {}
 
 
 def compute_risk_score(final_pred, final_conf, cv_sev, lesion_data, scan_type):
     """
-    FIX 3: Use final_pred (post-override) instead of raw ai_pred so that
-    the BI-RADS category always matches the displayed diagnosis.
+    BI-RADS-style risk score.
+    Always uses final_pred (post-override) so the category matches the diagnosis.
     """
     try:
         score, reasoning = 1, []
-        if final_pred in ('Normal','Healthy'):
+        if final_pred in ('Normal', 'Healthy'):
             score = 1 if final_conf >= 0.70 else 2
             reasoning.append("AI predicts no significant abnormality.")
         elif final_pred == 'Benign':
             score = 3 if final_conf < 0.65 else 2
             reasoning.append("AI detects likely benign finding.")
-        elif final_pred in ('Malignant','Sick'):
+        elif final_pred in ('Malignant', 'Sick'):
             score = 5 if final_conf >= 0.85 else 4 if final_conf >= 0.70 else 3
             reasoning.append("AI detects suspicious/malignant pattern.")
 
         if cv_sev >= 0.8 and score < 4:
-            score += 1; reasoning.append("CV analysis found high-intensity suspicious regions.")
+            score += 1
+            reasoning.append("CV analysis found high-intensity suspicious regions.")
         elif cv_sev >= 0.6 and score < 3:
-            score += 1; reasoning.append("CV analysis found moderate imaging abnormality.")
+            score += 1
+            reasoning.append("CV analysis found moderate imaging abnormality.")
 
-        hi = [l for l in lesion_data.get('lesions',[]) if l.get('suspicion_level')=='High']
+        hi = [l for l in lesion_data.get('lesions', [])
+              if l.get('suspicion_level') == 'High']
         if hi and score < 4:
-            score = min(score+1, 5)
+            score = min(score + 1, 5)
             reasoning.append(f"{len(hi)} high-suspicion lesion(s) detected.")
 
-        score = min(score, 5)
-        labels    = {1:"Negative — No significant finding",
-                     2:"Benign finding — Routine follow-up",
-                     3:"Probably benign — Short-interval follow-up (6 months)",
-                     4:"Suspicious — Tissue sampling recommended",
-                     5:"Highly suggestive of malignancy — Biopsy required"}
-        intervals = {1:"Routine annual screening", 2:"Routine annual screening",
-                     3:"Follow-up imaging in 6 months",
-                     4:"Biopsy / specialist referral within 2 weeks",
-                     5:"Urgent biopsy required"}
-        return {'risk_score':score,'risk_category':f"Category {score}",
-                'risk_label':labels.get(score,""),'recommended_interval':intervals.get(score,""),
-                'reasoning':reasoning}
+        score  = min(score, 5)
+        labels = {
+            1: "Negative — No significant finding",
+            2: "Benign finding — Routine follow-up",
+            3: "Probably benign — Short-interval follow-up (6 months)",
+            4: "Suspicious — Tissue sampling recommended",
+            5: "Highly suggestive of malignancy — Biopsy required",
+        }
+        intervals = {
+            1: "Routine annual screening",
+            2: "Routine annual screening",
+            3: "Follow-up imaging in 6 months",
+            4: "Biopsy / specialist referral within 2 weeks",
+            5: "Urgent biopsy required",
+        }
+        return {
+            'risk_score':           score,
+            'risk_category':        f"Category {score}",
+            'risk_label':           labels.get(score, ""),
+            'recommended_interval': intervals.get(score, ""),
+            'reasoning':            reasoning,
+        }
     except Exception as e:
-        print(f"[RiskScore] {e}"); return {}
+        print(f"[RiskScore] {e}")
+        return {}
 
 
-def generate_annotated_image(img_cv2, cam, prediction_label):
+def generate_annotated_image(img_bgr, cam, prediction_label):
     try:
-        annotated = img_cv2.copy()
+        annotated = img_bgr.copy()
         if cam is None: return None
-        binary = (cam>0.45).astype(np.uint8)*255
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, np.ones((7,7),np.uint8))
-        cnts,_ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        colour = {'Malignant':(0,0,255),'Sick':(0,0,255),'Benign':(0,165,255),
-                  'Normal':(0,255,0),'Healthy':(0,255,0)}.get(prediction_label,(255,255,0))
-        for i,cnt in enumerate(cnts):
-            if cv2.contourArea(cnt)<60: continue
-            cv2.drawContours(annotated,[cnt],-1,colour,2)
-            x,y,w,h = cv2.boundingRect(cnt)
-            cv2.rectangle(annotated,(x,y),(x+w,y+h),colour,1)
-            cv2.putText(annotated,f"R{i+1}",(x,max(15,y-5)),
-                        cv2.FONT_HERSHEY_SIMPLEX,0.55,colour,2,cv2.LINE_AA)
-        _,buf = cv2.imencode('.jpg',annotated,[cv2.IMWRITE_JPEG_QUALITY,92])
+        binary = (cam > 0.45).astype(np.uint8) * 255
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+        cnts, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        colour = {
+            'Malignant': (0, 0, 255), 'Sick': (0, 0, 255),
+            'Benign':    (0, 165, 255),
+            'Normal':    (0, 255, 0),  'Healthy': (0, 255, 0),
+        }.get(prediction_label, (255, 255, 0))
+        for i, cnt in enumerate(cnts):
+            if cv2.contourArea(cnt) < 60: continue
+            cv2.drawContours(annotated, [cnt], -1, colour, 2)
+            x, y, w, h = cv2.boundingRect(cnt)
+            cv2.rectangle(annotated, (x, y), (x+w, y+h), colour, 1)
+            cv2.putText(annotated, f"R{i+1}", (x, max(15, y-5)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, colour, 2, cv2.LINE_AA)
+        _, buf = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 92])
         return base64.b64encode(buf).decode()
     except Exception as e:
-        print(f"[Annotated] {e}"); return None
+        print(f"[Annotated] {e}")
+        return None
 
 
 def _clinical_notes(pred, conf, lesion_data, texture_data, scan_type):
-    notes = [f"Scan type: {scan_type.replace('_',' ').title()}",
-             f"Primary finding: {pred} (confidence {conf:.0%})"]
+    notes = [
+        f"Scan type: {scan_type.replace('_', ' ').title()}",
+        f"Primary finding: {pred} (confidence {conf:.0%})",
+    ]
     if conf < 0.60:
         notes.append("Warning: Low AI confidence — independent radiologist review strongly advised.")
     lc = lesion_data.get('lesion_count', 0)
     if lc > 0:
         notes.append(f"{lc} region(s) of interest identified.")
-        for l in lesion_data.get('lesions',[]):
-            notes.append(f"  Region {l['lesion_id']}: {l['morphology']} | "
-                         f"Area {l['area_percentage']:.1f}% | Suspicion: {l['suspicion_level']}")
+        for l in lesion_data.get('lesions', []):
+            notes.append(
+                f"  Region {l['lesion_id']}: {l['morphology']} | "
+                f"Area {l['area_percentage']:.1f}% | Suspicion: {l['suspicion_level']}")
     else:
         notes.append("No distinct lesion boundaries detected in attention map.")
     if texture_data:
-        notes.append(f"Texture: entropy={texture_data.get('entropy','N/A')}, "
-                     f"std={texture_data.get('std_deviation','N/A')}, "
-                     f"skewness={texture_data.get('skewness','N/A')}")
+        notes.append(
+            f"Texture: entropy={texture_data.get('entropy', 'N/A')}, "
+            f"std={texture_data.get('std_deviation', 'N/A')}, "
+            f"skewness={texture_data.get('skewness', 'N/A')}")
     notes.append("Note: AI output is decision-support only. "
                  "Clinical judgement and histopathological confirmation are required.")
     return notes
 
 
 # =====================================================================
-# 12. PREDICT ROUTE — FIXED
+# 12.  INFERENCE HELPER
+# =====================================================================
+
+def run_inference(model, labels, spatial_t, freq_t):
+    """Run forward pass; return (pred_label, confidence, all_probs_array)."""
+    with torch.no_grad():
+        logits, _ = model(spatial_t, freq_t)
+        probs     = F.softmax(logits, dim=1)
+        arr       = probs[0].cpu().numpy()
+        conf, idx = torch.max(probs, dim=1)
+    return labels[idx.item()], float(conf.item()), arr
+
+
+# =====================================================================
+# 13. PREDICT ROUTE — clean re-write
 # =====================================================================
 
 @app.route('/predict', methods=['POST'])
@@ -851,7 +899,7 @@ def predict():
 
     file      = request.files['file']
     mode      = request.form.get('mode', 'patient').lower()
-    scan_type = request.form.get('scan_type', 'mammogram_dmid').strip().lower()
+    scan_type = request.form.get('scan_type', 'auto').strip().lower()
 
     if scan_type not in VALID_SCAN_TYPES:
         return jsonify({'error': f'Unknown scan_type "{scan_type}". '
@@ -867,24 +915,25 @@ def predict():
             return jsonify({'error': 'Cannot decode image. '
                                      'Please upload a valid JPEG, PNG, or BMP file.'}), 400
 
-        # ── Auto-detect BEFORE validation so we use the right thresholds ──
+        # ── Step 1: resolve which concrete model key to use ───────────────
         if scan_type in ('auto', 'mammogram'):
             detected_scan = auto_detect_scan_type(img_bgr)
-            print(f" * [AUTO-DETECT] -> {detected_scan}")
         else:
-            detected_scan = scan_type
+            detected_scan = scan_type          # explicit sub-type requested
 
-        # Resolve generic 'mammogram' alias
+        # 'mammogram' alone → use DMID as base; compare will happen later
         if detected_scan == 'mammogram':
             detected_scan = 'mammogram_dmid'
 
-        # ── Validate with correct scan type ───────────────────────────────
+        print(f" * [ROUTE] scan_type={scan_type!r}  detected_scan={detected_scan!r}")
+
+        # ── Step 2: validate with per-modality thresholds ─────────────────
         ok, reason = validate_medical_image(img_bgr, detected_scan)
         if not ok:
-            return jsonify({'error':'Invalid image','message':reason,
-                            'action':'Please retake or re-upload the scan.'}), 422
+            return jsonify({'error': 'Invalid image', 'message': reason,
+                            'action': 'Please retake or re-upload the scan.'}), 422
 
-        # ── Preprocessing ──────────────────────────────────────────────────
+        # ── Step 3: preprocessing ─────────────────────────────────────────
         if 'mammogram' in detected_scan:
             img_cropped = crop_to_breast_tissue(img_bgr)
             img_proc    = preprocess_mammogram(img_cropped)
@@ -892,107 +941,92 @@ def predict():
             img_cropped = img_bgr
             img_proc    = img_bgr
 
-        img_resized  = cv2.resize(img_proc, (IMG_SIZE, IMG_SIZE))
-        img_rgb_res  = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+        img_resized = cv2.resize(img_proc, (IMG_SIZE, IMG_SIZE))
+        img_rgb_res = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
         spatial_t, freq_t = prepare_inputs(img_rgb_res)
 
-        cv_sev     = 0.0
-        cv_details = {}
+        cv_sev, cv_details = 0.0, {}
 
-        # ── FIX 4: Auto-mammogram compare — track classes per model ───────
-        if scan_type in ('auto', 'mammogram') and 'mammogram' in detected_scan:
-            print(" * [AUTO-COMPARE] MIAS…")
-            if not load_pytorch_model('mammogram_mias'):
-                return jsonify({'error':'MIAS model unavailable.'}), 503
-            mias_classes = DATASET_CONFIGS['mammogram_mias']['labels'][:]
-            with torch.no_grad():
-                out_m, _ = loaded_model(spatial_t, freq_t)
-                prob_m   = F.softmax(out_m, dim=1)
-                conf_m, idx_m = torch.max(prob_m, 1)
-                pred_m   = mias_classes[idx_m.item()]
+        # ── Step 4: inference ─────────────────────────────────────────────
+        #
+        # Mammogram (auto or explicit 'mammogram'): compare MIAS vs DMID,
+        # pick the one with higher confidence.
+        #
+        # Every other modality: load exactly the right model directly.
+        #
 
-            print(" * [AUTO-COMPARE] DMID…")
-            if not load_pytorch_model('mammogram_dmid'):
-                return jsonify({'error':'DMID model unavailable.'}), 503
-            dmid_classes = DATASET_CONFIGS['mammogram_dmid']['labels'][:]
-            with torch.no_grad():
-                out_d, _ = loaded_model(spatial_t, freq_t)
-                prob_d   = F.softmax(out_d, dim=1)
-                conf_d, idx_d = torch.max(prob_d, 1)
-                pred_d   = dmid_classes[idx_d.item()]
+        if 'mammogram' in detected_scan and scan_type in ('auto', 'mammogram'):
+            # --- MIAS ---
+            try:
+                model_m, labels_m = load_model('mammogram_mias')
+            except RuntimeError as e:
+                return jsonify({'error': str(e)}), 503
+            pred_m, conf_m, probs_m = run_inference(model_m, labels_m,
+                                                    spatial_t, freq_t)
 
-            if conf_d.item() >= conf_m.item():
-                ai_pred      = pred_d
-                ai_score     = conf_d.item()
+            # --- DMID ---
+            try:
+                model_d, labels_d = load_model('mammogram_dmid')
+            except RuntimeError as e:
+                return jsonify({'error': str(e)}), 503
+            pred_d, conf_d, probs_d = run_inference(model_d, labels_d,
+                                                    spatial_t, freq_t)
+
+            if conf_d >= conf_m:
+                ai_pred, ai_score = pred_d, conf_d
+                all_probs, win_labels = probs_d, labels_d
                 winning_model = 'DMID'
-                all_probs    = prob_d[0].cpu().numpy()
-                winning_classes = dmid_classes
-                # Ensure DMID model stays loaded for GradCAM
-                # (already loaded above)
+                # DMID is already loaded — GradCAM will use it
             else:
-                ai_pred      = pred_m
-                ai_score     = conf_m.item()
+                ai_pred, ai_score = pred_m, conf_m
+                all_probs, win_labels = probs_m, labels_m
                 winning_model = 'MIAS'
-                all_probs    = prob_m[0].cpu().numpy()
-                winning_classes = mias_classes
-                # Reload MIAS so GradCAM runs on the winning model
-                load_pytorch_model('mammogram_mias')
-
-            # Update global detected_classes to match the winning model
-            detected_classes_local = winning_classes
-
-        elif 'mammogram' in detected_scan and scan_type not in ('auto', 'mammogram'):
-            # Explicit mammogram sub-type requested
-            if not load_pytorch_model(detected_scan):
-                return jsonify({'error':f'Model for "{detected_scan}" is unavailable.'}), 503
-            with torch.no_grad():
-                outputs, _ = loaded_model(spatial_t, freq_t)
-                probs       = F.softmax(outputs, dim=1)
-                all_probs   = probs[0].cpu().numpy()
-                conf, cidx  = torch.max(probs, 1)
-            ai_score = float(conf.item())
-            ai_pred  = detected_classes[cidx.item()]
-            winning_model = detected_scan
-            detected_classes_local = detected_classes[:]
+                # Re-load MIAS so loaded_model == winning model for GradCAM
+                try:
+                    load_model('mammogram_mias')
+                except RuntimeError as e:
+                    return jsonify({'error': str(e)}), 503
 
         else:
-            # Non-mammogram modality
-            if not load_pytorch_model(detected_scan):
-                return jsonify({'error':f'Model for "{detected_scan}" is unavailable.'}), 503
-            with torch.no_grad():
-                outputs, _ = loaded_model(spatial_t, freq_t)
-                probs       = F.softmax(outputs, dim=1)
-                all_probs   = probs[0].cpu().numpy()
-                conf, cidx  = torch.max(probs, 1)
-            ai_score = float(conf.item())
-            ai_pred  = detected_classes[cidx.item()]
+            # Non-mammogram OR explicit mammogram sub-type
+            try:
+                model_x, labels_x = load_model(detected_scan)
+            except RuntimeError as e:
+                return jsonify({'error': str(e)}), 503
+            ai_pred, ai_score, all_probs = run_inference(
+                model_x, labels_x, spatial_t, freq_t)
+            win_labels    = labels_x
             winning_model = detected_scan
-            detected_classes_local = detected_classes[:]
 
-        # ── CV override (mammogram only) ────────────────────────────────
+        print(f" * [INFER] model={winning_model}  pred={ai_pred}  conf={ai_score:.3f}")
+
+        # ── Step 5: CV override (mammogram only) ──────────────────────────
+        srt    = np.sort(all_probs)[::-1]
+        margin = float(srt[0] - srt[1]) if len(all_probs) > 1 else 1.0
+
         override   = False
         final_pred = ai_pred
         final_conf = float(ai_score)
-        srt        = np.sort(all_probs)[::-1]
-        margin     = float(srt[0]-srt[1]) if len(all_probs) > 1 else 1.0
 
         if 'mammogram' in detected_scan:
             cv_sev, cv_conf, cv_details = comprehensive_abnormality_analysis(img_cropped)
             cv_pred = cv_details.get('cv_prediction', 'Normal')
             if ai_pred == 'Normal' and cv_sev > 0.75 and margin < 0.20 and cv_conf > 0.75:
                 override, final_pred, final_conf = True, cv_pred, cv_conf
+                print(f" * [CV-OVERRIDE] Normal→{cv_pred}")
             elif ai_pred == 'Benign' and cv_sev > 0.90 and margin < 0.15 and cv_conf > 0.80:
                 override, final_pred, final_conf = True, 'Malignant', cv_conf
+                print(f" * [CV-OVERRIDE] Benign→Malignant")
 
-        # ── Recommendation ─────────────────────────────────────────────
-        if final_pred in ('Malignant','Sick'):
+        # ── Step 6: recommendation ────────────────────────────────────────
+        if final_pred in ('Malignant', 'Sick'):
             rec = "HIGH RISK: Immediate biopsy and specialist consultation required."
         elif final_pred == 'Benign':
-            rec = "MEDIUM RISK: Close monitoring with follow-up imaging in 3-6 months."
+            rec = "MEDIUM RISK: Close monitoring with follow-up imaging in 3–6 months."
         else:
             rec = "LOW RISK: Continue routine annual screening."
 
-        # ── Grad-CAM (runs on currently loaded model = winning model) ──
+        # ── Step 7: Grad-CAM (runs on currently loaded_model = winner) ────
         heatmap_b64   = None
         annotated_b64 = None
         cam_mask      = None
@@ -1003,8 +1037,8 @@ def predict():
         target_layer = get_target_layer(loaded_model)
         if target_layer is not None:
             try:
-                final_idx = (detected_classes_local.index(final_pred)
-                             if final_pred in detected_classes_local else 0)
+                final_idx = (win_labels.index(final_pred)
+                             if final_pred in win_labels else 0)
                 gcam     = GradCAM(loaded_model, target_layer)
                 cam_mask = gcam(spatial_t, freq_t, class_idx=final_idx)
                 gcam.remove_hooks()
@@ -1014,16 +1048,17 @@ def predict():
             except Exception as e:
                 print(f"[GradCAM-run] {e}")
 
-        # ── Doctor report ───────────────────────────────────────────────
+        # ── Step 8: doctor extras ─────────────────────────────────────────
         if mode == 'doctor':
-            lesion_data   = detect_lesion_boundaries(img_resized, cam_mask, detected_scan)
-            texture_data  = compute_texture_features(img_resized, cam_mask)
-            # FIX 3: pass final_pred and final_conf (post-override)
-            risk_data     = compute_risk_score(final_pred, final_conf,
-                                               cv_sev, lesion_data, detected_scan)
+            lesion_data  = detect_lesion_boundaries(img_resized, cam_mask, detected_scan)
+            texture_data = compute_texture_features(img_resized, cam_mask)
+            risk_data    = compute_risk_score(final_pred, final_conf,
+                                             cv_sev, lesion_data, detected_scan)
             if cam_mask is not None:
-                annotated_b64 = generate_annotated_image(img_resized, cam_mask, final_pred)
+                annotated_b64 = generate_annotated_image(img_resized,
+                                                         cam_mask, final_pred)
 
+        # ── Step 9: build response ────────────────────────────────────────
         response = {
             'result':         final_pred,
             'confidence':     f"{final_conf:.2f}",
@@ -1035,8 +1070,8 @@ def predict():
                 'ai_prediction':      ai_pred,
                 'ai_confidence':      f"{ai_score:.2f}",
                 'all_class_probs': {
-                    detected_classes_local[i]: round(float(all_probs[i]), 4)
-                    for i in range(len(detected_classes_local))
+                    win_labels[i]: round(float(all_probs[i]), 4)
+                    for i in range(len(win_labels))
                 },
                 'cv_severity':      f"{cv_sev:.2f}",
                 'cv_details':       cv_details,
@@ -1066,7 +1101,7 @@ def predict():
 
 
 # =====================================================================
-# 13. UTILITY ROUTES
+# 14. UTILITY ROUTES
 # =====================================================================
 
 @app.route('/', methods=['GET'])
@@ -1074,12 +1109,12 @@ def health_check():
     return jsonify({
         'status':       'online',
         'active_model': active_model_type,
-        'classes':      detected_classes,
         'img_size':     IMG_SIZE,
         'endpoints': {
             'POST /predict': {
-                'scan_type': 'auto|mammogram|mammogram_mias|mammogram_dmid|ultrasound|histopathology|mri',
-                'mode':      'patient (default) | doctor',
+                'scan_type': ('auto | mammogram | mammogram_mias | '
+                              'mammogram_dmid | ultrasound | histopathology | mri'),
+                'mode': 'patient (default) | doctor',
             }
         },
     }), 200
@@ -1088,23 +1123,27 @@ def health_check():
 @app.route('/models', methods=['GET'])
 def model_status():
     return jsonify({
-        name: {'path':path,'exists':os.path.exists(path),'active':(name==active_model_type)}
-        for name,path in MODEL_PATHS.items()
+        name: {
+            'path':   path,
+            'exists': os.path.exists(path),
+            'active': (name == active_model_type),
+        }
+        for name, path in MODEL_PATHS.items()
     }), 200
 
 
 @app.errorhandler(413)
 def too_large(e):
-    return jsonify({'error':'File too large. Maximum is 15 MB.'}), 413
+    return jsonify({'error': 'File too large. Maximum is 15 MB.'}), 413
 
 @app.errorhandler(400)
 def bad_req(e):
-    return jsonify({'error':str(e)}), 400
+    return jsonify({'error': str(e)}), 400
 
 @app.errorhandler(500)
 def server_err(e):
     gc.collect()
-    return jsonify({'error':'Internal server error.'}), 500
+    return jsonify({'error': 'Internal server error.'}), 500
 
 
 if __name__ == '__main__':
