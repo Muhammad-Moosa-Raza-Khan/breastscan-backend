@@ -284,7 +284,7 @@ def load_model(scan_type):
 
 # Pre-load default
 try:
-    load_model('mammogram_dmid')
+    load_model('mammogram_mias')
 except Exception as e:
     print(f"[STARTUP] {e}")
 
