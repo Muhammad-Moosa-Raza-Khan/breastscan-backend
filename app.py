@@ -120,7 +120,7 @@ class MedFormerULTRA(nn.Module):
         self.classifier = nn.Sequential(nn.Linear(512, 256), nn.LayerNorm(256),
                                          nn.ReLU(True), nn.Dropout(0.3),
                                          nn.Linear(256, num_classes))
-        self.aux = nn.Linear(cd, num_classes)
+        self.aux_classifier = nn.Linear(cd, num_classes)
 
     def forward(self, x, freq, return_all=False):
         feats  = self.backbone(x)
@@ -139,7 +139,7 @@ class MedFormerULTRA(nn.Module):
         fused     = self.fusion(torch.cat([pooled, freq_feat], dim=1))
         logits    = self.classifier(fused)
         if return_all: return logits, self.aux(pooled), gw
-        return logits, self.aux(pooled)
+        return logits, self.aux_classifier(pooled)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
