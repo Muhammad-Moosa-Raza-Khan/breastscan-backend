@@ -1,4 +1,3 @@
-"""
 MedScan API — Production Backend  v7.2 (with Chatbot Integration)
 All issues from v6 fixed:
 
