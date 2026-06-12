@@ -1,5 +1,5 @@
 """
-MedScan API — Production Backend  v7
+MedScan API — Production Backend  v7.2 (with Chatbot Integration)
 All issues from v6 fixed:
 
   FIX-1  GradCAM invisible on histopathology
@@ -22,7 +22,9 @@ All issues from v6 fixed:
 
   FIX-6  BI-RADS score: Malignant prediction always maps to Category ≥ 4 (not Category 3).
 
-  FIX-7  GradCAM scattered dots on benign histo → per-pixel alpha removes dot artifacts.
+  FIX-7  GradCAM visual upgrade → Kaggle-style red channel mapping with smooth addWeighted blending.
+
+  NEW    Gemini 2.5 Flash Chatbot Integration for contextual scan Q&A.
 """
 
 import os, gc, base64, traceback
@@ -35,6 +37,10 @@ import timm
 import torchvision.transforms as T
 from scipy.fftpack import dct
 from flask import Flask, request, jsonify
+
+# LLM Chatbot Integration
+from google import genai
+from google.genai import types
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. CONSTANTS
@@ -59,10 +65,7 @@ DATASET_CONFIGS = {
 }
 VALID_SCAN_TYPES = set(DATASET_CONFIGS.keys()) | {'mammogram', 'auto'}
 
-# FIX-2: ultrasound is grayscale B-mode — remove from colour set
-COLOUR_MODALITIES = {'histopathology'}   # only H&E slides are truly colour
-
-# Modalities where contour lesion detection makes sense
+COLOUR_MODALITIES = {'histopathology'}
 LESION_MODALITIES = {'mammogram_dmid', 'mammogram_mias', 'ultrasound'}
 
 active_model_type = None
@@ -137,7 +140,7 @@ class MedFormerULTRA(nn.Module):
         self.classifier     = nn.Sequential(nn.Linear(512,256), nn.LayerNorm(256),
                                             nn.ReLU(True), nn.Dropout(0.3),
                                             nn.Linear(256,num_classes))
-        self.aux_classifier = nn.Linear(cd, num_classes)  # FIX-4: correct name
+        self.aux_classifier = nn.Linear(cd, num_classes)
 
     def forward(self, x, freq, return_all=False):
         feats  = self.backbone(x)
@@ -154,7 +157,7 @@ class MedFormerULTRA(nn.Module):
         pooled  = self.gpool(feat).flatten(1)
         fused   = self.fusion(torch.cat([pooled, self.freq_encoder(freq).flatten(1)],1))
         logits  = self.classifier(fused)
-        aux     = self.aux_classifier(pooled)   # FIX-4: was self.aux → AttributeError
+        aux     = self.aux_classifier(pooled)
         if return_all: return logits, aux, gw
         return logits, aux
 
@@ -165,7 +168,6 @@ class MedFormerULTRA(nn.Module):
 
 def _dct2(x):
     return dct(dct(x.T, norm='ortho').T, norm='ortho')
-
 
 def extract_freq_tensor(img_rgb_f32, size=320):
     gray = cv2.cvtColor((img_rgb_f32*255).astype(np.uint8),
@@ -182,7 +184,7 @@ def extract_freq_tensor(img_rgb_f32, size=320):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. PREPROCESSING (colour-aware CLAHE)
+# 4. PREPROCESSING
 # ─────────────────────────────────────────────────────────────────────────────
 
 _spatial_tf = T.Compose([
@@ -192,13 +194,7 @@ _spatial_tf = T.Compose([
     T.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]),
 ])
 
-
 def prepare_inputs(img_rgb_uint8, scan_type):
-    """
-    Histopathology: LAB CLAHE preserves H&E colour.
-    All other modalities: grayscale CLAHE (correct for mammogram, MRI, ultrasound B-mode).
-    FIX-2: ultrasound no longer uses LAB CLAHE.
-    """
     if scan_type in COLOUR_MODALITIES:
         bgr    = cv2.cvtColor(img_rgb_uint8, cv2.COLOR_RGB2BGR)
         lab    = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
@@ -255,14 +251,10 @@ except Exception as e:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. MODALITY DETECTOR  v7
-#
-# FIX-2: Ultrasound cyst (lap very low) now detected via dark60+lv_std speckle test
-# FIX-3: Mammogram not confused with MRI via horizontal-edge brightness guard
+# 6. MODALITY DETECTOR
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _he_pct(img_bgr):
-    """H&E hue pixel ratio in centre crop. Histopathology reliably > 8%."""
     h,w  = img_bgr.shape[:2]
     crop = img_bgr[int(h*0.08):int(h*0.92), int(w*0.05):int(w*0.95)]
     hsv  = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
@@ -271,9 +263,7 @@ def _he_pct(img_bgr):
     purple = (hu>=120)&(hu<=160)&(sa>25)
     return float((pink|purple).mean()*100)
 
-
 def _lv_std_bright(gray, thresh=60, bs=8):
-    """Std of block-wise variances in non-dark regions. High = speckle (ultrasound)."""
     h,w = gray.shape
     bv  = []
     for r in range(0, h-bs, bs):
@@ -283,26 +273,16 @@ def _lv_std_bright(gray, thresh=60, bs=8):
                 bv.append(float(np.var(p)))
     return float(np.std(bv)) if bv else 0.0
 
-
 def auto_detect_scan_type(img_bgr):
-    """
-    Priority chain:
-      1. Histopathology — H&E hue pixel ratio > 8%
-      2. MRI            — 3+ dark edges + bright centre + NOT touching horizontal edges
-      3. Ultrasound     — high Laplacian OR (dark shadow + speckle heterogeneity)
-      4. Mammogram      — fallback
-    """
     try:
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY) if len(img_bgr.shape)==3 else img_bgr.copy()
         h,w  = gray.shape
 
-        # ── 1. Histopathology ──────────────────────────────────────────────
         he = _he_pct(img_bgr)
         if he > 8.0:
             print(f"   [AUTO] histopathology  H&E={he:.1f}%")
             return 'histopathology'
 
-        # ── 2. MRI ─────────────────────────────────────────────────────────
         ew       = max(int(h*0.08), 10)
         em       = [gray[:ew,:].mean(), gray[-ew:,:].mean(),
                     gray[:,:ew].mean(), gray[:,-ew:].mean()]
@@ -311,16 +291,14 @@ def auto_detect_scan_type(img_bgr):
         c_mean   = float(gray[h4:3*h4, w4:3*w4].mean())
         c_ratio  = (c_mean - min(em)) / (c_mean + 1e-6)
 
-        # FIX-3: mammogram bright tissue always touches a horizontal (left/right) edge
         left_b  = float((gray[:, :w//10] > 80).mean())
         right_b = float((gray[:, -w//10:] > 80).mean())
-        touches_horiz = max(left_b, right_b) > 0.35  # breast tissue on one side
+        touches_horiz = max(left_b, right_b) > 0.35
 
         if dark_n >= 3 and c_ratio > 0.40 and not touches_horiz:
             print(f"   [AUTO] mri  dark_n={dark_n} c_ratio={c_ratio:.2f} horiz={max(left_b,right_b):.2f}")
             return 'mri'
 
-        # ── 3. Ultrasound ──────────────────────────────────────────────────
         lap    = float(cv2.Laplacian(gray, cv2.CV_64F).var())
         dark60 = float((gray < 60).mean() * 100)
         lv_std = _lv_std_bright(gray, thresh=60)
@@ -328,14 +306,13 @@ def auto_detect_scan_type(img_bgr):
         if lap > 500:
             print(f"   [AUTO] ultrasound  lap={lap:.0f}")
             return 'ultrasound'
-        if dark60 > 30 and lv_std > 150:   # cyst + speckle (FIX-2)
+        if dark60 > 30 and lv_std > 150:
             print(f"   [AUTO] ultrasound  dark60={dark60:.0f}% lv_std={lv_std:.0f}")
             return 'ultrasound'
-        if dark60 > 55:                    # very large dark area (anechoic cyst)
+        if dark60 > 55:
             print(f"   [AUTO] ultrasound  dark60={dark60:.0f}%")
             return 'ultrasound'
 
-        # ── 4. Mammogram ───────────────────────────────────────────────────
         print(f"   [AUTO] mammogram_dmid  fallback lap={lap:.0f} dark60={dark60:.1f}% lv_std={lv_std:.0f}")
         return 'mammogram_dmid'
 
@@ -351,7 +328,6 @@ def auto_detect_scan_type(img_bgr):
 _BLUR_MIN = {'mammogram_mias':5,'mammogram_dmid':5,'mri':8,'ultrasound':5,'histopathology':15}
 _STD_MIN  = {'mammogram_mias':4,'mammogram_dmid':4,'mri':6,'ultrasound':4,'histopathology':8}
 
-
 def validate_medical_image(img_bgr, scan_type):
     try:
         h,w = img_bgr.shape[:2]
@@ -366,7 +342,7 @@ def validate_medical_image(img_bgr, scan_type):
             return False,f"Image too blurry (sharpness={lap:.1f}, min={_BLUR_MIN.get(scan_type,5)})."
         if float(np.std(gray))<_STD_MIN.get(scan_type,4):
             return False,"Insufficient contrast."
-        # Colour check only for grayscale modalities
+
         if len(img_bgr.shape)==3 and scan_type not in COLOUR_MODALITIES:
             b2,g2,r2 = [img_bgr[:,:,i].astype(float) for i in range(3)]
             ch_diff = max(float(np.mean(np.abs(r2-g2))),
@@ -375,14 +351,14 @@ def validate_medical_image(img_bgr, scan_type):
             if ch_diff > 40:
                 return False,(f"Does not look like a {scan_type.replace('_',' ')} scan. "
                               "Please upload a proper grayscale medical image.")
-        # Screenshot guard (centre crop)
+
         gc2   = gray[int(h*0.05):int(h*0.95),int(w*0.05):int(w*0.95)]
         edges = cv2.Canny(gc2,50,150)
         lines = cv2.HoughLinesP(edges,1,np.pi/2,threshold=120,
                                 minLineLength=int(w*0.75),maxLineGap=10)
         if lines is not None and len(lines)>6:
             return False,"Appears to be a screenshot. Please crop to the scan only."
-        # Solid-colour guard
+
         bs=32; bv=np.array([float(np.var(gray[r*bs:(r+1)*bs,c*bs:(c+1)*bs]))
                              for r in range(h//bs) for c in range(w//bs)] or [100.])
         if bv.size>0 and (bv<5).sum()/bv.size>0.85:
@@ -403,7 +379,6 @@ def preprocess_mammogram(img_bgr):
         return cv2.cvtColor(den,cv2.COLOR_GRAY2BGR)
     except Exception: return img_bgr
 
-
 def crop_to_breast_tissue(img_bgr):
     try:
         gray     = cv2.cvtColor(img_bgr,cv2.COLOR_BGR2GRAY) if len(img_bgr.shape)==3 else img_bgr
@@ -418,7 +393,6 @@ def crop_to_breast_tissue(img_bgr):
             return img_bgr[max(0,y-pad):min(hi,y+h+pad),max(0,x-pad):min(wi,x+w+pad)]
         return img_bgr
     except Exception: return img_bgr
-
 
 def get_tissue_mask(img_bgr):
     try:
@@ -459,19 +433,10 @@ def cv_abnormality(img_bgr):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 10. GRAD-CAM  (complete rewrite — FIX-1, FIX-5)
-#
-# Design:
-#   • Hook into model.proj1[0] — a guaranteed 1×1 Conv2d that processes
-#     feats[-2] (the second-to-last backbone stage, ~20×20 for 320px input).
-#     This gives good spatial resolution and stable gradients.
-#   • Per-pixel alpha blending: overlay intensity ∝ cam activation.
-#     No threshold needed → always produces visible results.
-#   • Heatmap drawn on ORIGINAL image at native resolution (FIX-5).
+# 10. GRAD-CAM  (Upgraded with Red/Jet Blending)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class GradCAM:
-    """Grad-CAM hooked into a single specified layer."""
     def __init__(self, model, layer):
         self.model = model; self.acts = None; self.grads = None
         self._h = [
@@ -488,30 +453,22 @@ class GradCAM:
             self.model.zero_grad()
             logits[0, cls_idx].backward(retain_graph=True)
             if self.acts is None or self.grads is None: return None
-            weights = self.grads.cpu().numpy()[0].mean(axis=(1,2))   # (C,)
-            acts    = self.acts.cpu().numpy()[0]                      # (C,H,W)
+            weights = self.grads.cpu().numpy()[0].mean(axis=(1,2))
+            acts    = self.acts.cpu().numpy()[0]
             cam     = np.maximum((weights[:,None,None] * acts).sum(0), 0)
             if cam.max() > 0: cam /= cam.max()
-            return cam   # raw spatial map, will be resized in overlay fn
+            return cam
         except Exception as e:
             print(f"[GradCAM.__call__] {e}"); traceback.print_exc(); return None
 
 
 def get_gradcam_layer(model):
-    """
-    FIX-1: Hook into model.proj1[0] — the Conv2d that projects feats[-2].
-    feats[-2] is the second-to-last EfficientNetV2-S stage: ~20×20 for 320px input.
-    This gives clean spatial maps without the blocky artefacts of deeper 10×10 layers.
-    Falls back to last Conv2d in backbone if proj1 not accessible.
-    """
     try:
-        # proj1 = Sequential(Conv2d, BN, ReLU) — index 0 is the Conv2d
         if hasattr(model, 'proj1') and isinstance(model.proj1[0], nn.Conv2d):
             print("   [GradCAM] using model.proj1[0]")
             return model.proj1[0]
     except Exception:
         pass
-    # Fallback: last backbone conv with ≥ 64 channels
     best = None
     for m in model.backbone.modules():
         if isinstance(m, nn.Conv2d) and m.out_channels >= 64:
@@ -519,45 +476,54 @@ def get_gradcam_layer(model):
     return best
 
 
-def generate_heatmap_overlay(img_bgr_display, cam, scan_type):
+def generate_heatmap_overlay(img_bgr_display, cam, scan_type, style='red'):
     """
-    FIX-1 + FIX-5:
-    • img_bgr_display is the ORIGINAL image at its native resolution.
-    • cam is resized to match it.
-    • Per-pixel alpha blending: alpha = cam_value * 0.80
-      → High-activation regions show the heatmap at up to 80% intensity.
-      → Zero-activation regions show the original image unchanged.
-    • Always produces a visible result — no threshold needed.
-    • COLORMAP_JET used universally (visible on both greyscale and pink tissue).
+    Upgraded Visuals: Uses cv2.addWeighted and exact colormap logic
+    from the visual script, while preserving native model hooks.
+    style: 'jet' or 'red'
     """
     try:
         if cam is None: return None
-        img      = img_bgr_display.copy()
-        h_d,w_d  = img.shape[:2]
 
-        # Resize CAM to display image size
-        cam_rs = cv2.resize(cam, (w_d,h_d), interpolation=cv2.INTER_CUBIC)
+        # 1. Prepare original image
+        img = img_bgr_display.copy()
+        h_d, w_d = img.shape[:2]
+
+        # 2. Resize and normalize CAM
+        cam_rs = cv2.resize(cam, (w_d, h_d), interpolation=cv2.INTER_CUBIC)
         cam_rs = np.clip(cam_rs, 0, None)
         if cam_rs.max() > 0: cam_rs /= cam_rs.max()
 
-        # Smooth
-        ksz = max(11, int(min(h_d,w_d)*0.04) | 1)   # kernel = ~4% of image, always odd
-        cam_rs = cv2.GaussianBlur(cam_rs, (ksz,ksz), 0)
+        # 3. Smooth the heatmap
+        ksz = max(11, int(min(h_d, w_d) * 0.04) | 1)
+        cam_rs = cv2.GaussianBlur(cam_rs, (ksz, ksz), 0)
         if cam_rs.max() > 0: cam_rs /= cam_rs.max()
 
-        # Tissue mask (mammogram background → zero)
+        # 4. Mask out mammogram background (keep background black)
         if 'mammogram' in scan_type:
             tissue = (get_tissue_mask(img) > 0).astype(np.float32)
             cam_rs = cam_rs * tissue
 
-        # Per-pixel alpha blend
-        colored = cv2.applyColorMap(np.uint8(255*cam_rs), cv2.COLORMAP_JET)
-        alpha   = (cam_rs * 0.80)[:,:,np.newaxis]          # (H,W,1), max 0.80
-        overlay = (alpha * colored.astype(np.float32) +
-                   (1-alpha) * img.astype(np.float32)).astype(np.uint8)
+        # 5. Apply Colormaps
+        heatmap_enhanced = np.uint8(255 * cam_rs)
 
-        _,buf = cv2.imencode('.jpg', overlay, [cv2.IMWRITE_JPEG_QUALITY,95])
+        if style == 'red':
+            # Pure Red Channel (Medical-friendly highlight)
+            heatmap_colored = np.zeros_like(img)
+            heatmap_colored[..., 2] = heatmap_enhanced  # Red channel in BGR
+            alpha = 0.6
+        else:
+            # Standard Jet Colormap
+            heatmap_colored = cv2.applyColorMap(heatmap_enhanced, cv2.COLORMAP_JET)
+            alpha = 0.5
+
+        # 6. Smooth Blending
+        overlay = cv2.addWeighted(img, 1 - alpha, heatmap_colored, alpha, 0)
+
+        # 7. Encode for frontend
+        _, buf = cv2.imencode('.jpg', overlay, [cv2.IMWRITE_JPEG_QUALITY, 95])
         return base64.b64encode(buf).decode()
+
     except Exception as e:
         print(f"[Heatmap] {e}"); traceback.print_exc(); return None
 
@@ -567,7 +533,6 @@ def generate_heatmap_overlay(img_bgr_display, cam, scan_type):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def detect_lesion_boundaries(img_bgr, cam, scan_type):
-    """Only for mammogram and ultrasound. Uses p75 threshold on cam."""
     empty = {'lesion_count':0,'lesions':[],'total_lesion_area_pct':0.0,'overall_morphology':'N/A'}
     if scan_type not in LESION_MODALITIES: return empty
     try:
@@ -575,7 +540,6 @@ def detect_lesion_boundaries(img_bgr, cam, scan_type):
         h_i,w_i = img_bgr.shape[:2]
         cam_rs   = cv2.resize(cam,(w_i,h_i),interpolation=cv2.INTER_CUBIC)
         if cam_rs.max()>0: cam_rs/=cam_rs.max()
-        # Threshold at 75th percentile of non-zero values
         nonzero  = cam_rs[cam_rs>0]
         thr      = float(np.percentile(nonzero,75)) if len(nonzero)>0 else 0.5
         binary   = (cam_rs>thr).astype(np.uint8)*255
@@ -624,7 +588,6 @@ def _susp(c,s,mi):
 
 
 def annotated_image(img_bgr, cam, pred_label, scan_type):
-    """Lesion boundary overlay — only for mammogram/ultrasound."""
     if scan_type not in LESION_MODALITIES: return None
     try:
         if cam is None: return None
@@ -673,7 +636,6 @@ def compute_texture(img_bgr, cam=None):
 
 
 def compute_risk(pred, conf, cv_sev, lesion_data, scan_type):
-    """FIX-6: Malignant always → Category ≥ 4 regardless of confidence."""
     try:
         sc,rs=1,[]
         if pred in ('Normal','Healthy'):
@@ -681,7 +643,6 @@ def compute_risk(pred, conf, cv_sev, lesion_data, scan_type):
         elif pred=='Benign':
             sc=3 if conf<0.65 else 2; rs.append("AI detects likely benign finding.")
         elif pred in ('Malignant','Sick'):
-            # FIX-6: minimum Category 4 for any malignant call
             sc=5 if conf>=0.85 else 4; rs.append("AI detects suspicious/malignant pattern.")
         if cv_sev>=0.8 and sc<4: sc+=1; rs.append("CV analysis found high-intensity suspicious regions.")
         elif cv_sev>=0.6 and sc<3: sc+=1; rs.append("CV analysis found moderate imaging abnormality.")
@@ -771,7 +732,6 @@ def predict():
                             'action':'Please retake or re-upload the scan.'}),422
 
         # ── 3. Preprocessing ───────────────────────────────────────────────
-        # Keep original image for display (FIX-5)
         img_display = img_bgr.copy()
 
         if 'mammogram' in detected:
@@ -781,7 +741,6 @@ def predict():
             img_crop = img_bgr
             img_proc = img_bgr
 
-        # Resize to IMG_SIZE only for MODEL INPUT
         img_rs  = cv2.resize(img_proc,(IMG_SIZE,IMG_SIZE))
         img_rgb = cv2.cvtColor(img_rs,cv2.COLOR_BGR2RGB)
         sp,fr   = prepare_inputs(img_rgb, detected)
@@ -795,6 +754,9 @@ def predict():
             try: model_m,lbl_m = load_model('mammogram_mias')
             except RuntimeError as e: return jsonify({'error':str(e)}),503
             pm,cm,prm = run_inference(model_m,lbl_m,sp,fr)
+
+            # MEMORY LEAK FIX: Clear the first model before loading the second
+            del model_m; gc.collect()
 
             try: model_d,lbl_d = load_model('mammogram_dmid')
             except RuntimeError as e: return jsonify({'error':str(e)}),503
@@ -834,7 +796,7 @@ def predict():
              if final_pred=='Benign' else
              "LOW RISK: Continue routine annual screening.")
 
-        # ── 7. GradCAM (FIX-1, FIX-5) ─────────────────────────────────────
+        # ── 7. GradCAM (Upgraded Blending) ─────────────────────────────────
         hmap_b64=None; ann_b64=None; cam_mask=None
         lesion_d={}; tex_d={}; risk_d={}
 
@@ -846,14 +808,13 @@ def predict():
                 cam_mask = gcam(sp, fr, cls_idx)
                 gcam.remove()
                 if cam_mask is not None:
-                    # FIX-5: draw on ORIGINAL image at native resolution
-                    hmap_b64 = generate_heatmap_overlay(img_display, cam_mask, detected)
+                    # Switch to style='jet' here if you want standard rainbow colors
+                    hmap_b64 = generate_heatmap_overlay(img_display, cam_mask, detected, style='red')
             except Exception as e:
                 print(f"[GradCAM-run] {e}"); traceback.print_exc()
 
         # ── 8. Doctor extras ───────────────────────────────────────────────
         if mode=='doctor':
-            # Lesion detection on original-size image
             lesion_d = detect_lesion_boundaries(img_display, cam_mask, detected)
             tex_d    = compute_texture(img_display, cam_mask)
             risk_d   = compute_risk(final_pred,final_conf,cv_sev,lesion_d,detected)
@@ -891,6 +852,55 @@ def predict():
     except Exception as e:
         print(f"[PREDICT ERROR] {e}"); traceback.print_exc(); gc.collect()
         return jsonify({'error':'Internal server error. Please try again.'}),500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 13.5 CHAT ROUTE (BreastScan AI Assistant)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route('/chat', methods=['POST'])
+def chat():
+    data = request.json
+    if not data or 'message' not in data or 'report' not in data:
+        return jsonify({'error': 'Missing message or report data.'}), 400
+
+    user_message = data['message']
+    patient_report_json = data['report']
+
+    try:
+        # Initialize the client (automatically reads GEMINI_API_KEY from environment)
+        client = genai.Client()
+
+        # The System Instruction Prompt: Grounds the LLM in your specific JSON data.
+        sys_instruct = f"""
+        You are BreastScan's empathetic, highly intelligent AI medical assistant. 
+        The user has just received a multi-modality deep learning scan result. 
+        Here is the raw data of their scan, including CV analysis, lesion boundaries, and risk scoring:
+        {patient_report_json}
+        
+        Your job is to answer the user's questions about this specific scan data. 
+        Be compassionate, clear, and avoid overly dense jargon. 
+        Crucially: Always remind the user that you are an AI decision-support tool and they must consult a human radiologist.
+        """
+
+        # Configure the AI parameters
+        config = types.GenerateContentConfig(
+            system_instruction=sys_instruct,
+            temperature=0.3, # Keeps responses grounded and factual
+        )
+
+        # Generate the response using the fast flash model
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=user_message,
+            config=config
+        )
+
+        return jsonify({"reply": response.text})
+
+    except Exception as e:
+        print(f"[CHAT ERROR] {e}"); traceback.print_exc()
+        return jsonify({'error': 'Failed to generate chat response.'}), 500
 
 
 # ─────────────────────────────────────────────────────────────────────────────
