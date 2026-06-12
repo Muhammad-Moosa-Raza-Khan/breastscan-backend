@@ -1,3 +1,4 @@
+"""
 MedScan API — Production Backend  v7.2 (with Chatbot Integration)
 All issues from v6 fixed:
 
@@ -872,13 +873,13 @@ def chat():
 
         # The System Instruction Prompt: Grounds the LLM in your specific JSON data.
         sys_instruct = f"""
-        You are BreastScan's empathetic, highly intelligent AI medical assistant. 
-        The user has just received a multi-modality deep learning scan result. 
+        You are BreastScan's empathetic, highly intelligent AI medical assistant.
+        The user has just received a multi-modality deep learning scan result.
         Here is the raw data of their scan, including CV analysis, lesion boundaries, and risk scoring:
         {patient_report_json}
-        
-        Your job is to answer the user's questions about this specific scan data. 
-        Be compassionate, clear, and avoid overly dense jargon. 
+
+        Your job is to answer the user's questions about this specific scan data.
+        Be compassionate, clear, and avoid overly dense jargon.
         Crucially: Always remind the user that you are an AI decision-support tool and they must consult a human radiologist.
         """
 
