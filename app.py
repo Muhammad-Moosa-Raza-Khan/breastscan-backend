@@ -1,30 +1,10 @@
 """
-MedScan API — Production Backend  v7.2 (with Chatbot Integration)
-All issues from v6 fixed:
-
-  FIX-1  GradCAM invisible on histopathology
-         → New per-pixel alpha blending: overlay always visible regardless of confidence.
-         → Hook moved to model.proj1[0] (reliable 20x20 spatial, not deep backbone internals).
-         → GaussianBlur sigma auto-scaled to image size; no hard percentile threshold.
-
-  FIX-2  Ultrasound → mammogram misdetection (lap=20 cyst image fell through all thresholds)
-         → Added local-variance-std speckle detector: dark60>30% AND lv_std>150 → ultrasound.
-         → Ultrasound removed from COLOUR_MODALITIES (B-mode is genuinely grayscale).
-
-  FIX-3  Mammogram → MRI misdetection (3 dark edges + high c_ratio)
-         → Added horizontal-edge brightness guard: if bright breast tissue touches
-           left OR right edge (horiz_bright>0.35), cannot be MRI.
-         → MRI brain tissue is always SURROUNDED by dark skull, never touching a horizontal edge.
-
-  FIX-4  self.aux typo kept from v5 → self.aux_classifier used consistently.
-
-  FIX-5  Display heatmap on original image at native resolution, not on 320×320 resized crop.
-
-  FIX-6  BI-RADS score: Malignant prediction always maps to Category ≥ 4 (not Category 3).
-
-  FIX-7  GradCAM visual upgrade → Kaggle-style red channel mapping with smooth addWeighted blending.
-
-  NEW    Gemini 2.5 Flash Chatbot Integration for contextual scan Q&A.
+MedScan API — Production Backend  v8.0 (Custom GradCAM & Open Chatbot)
+Updates:
+ - GradCAM completely replaced with user-provided PyTorch hook implementation.
+ - Heatmap blending uses exact create_red_heatmap() and apply_heatmap() logic.
+ - Gemini Chatbot made highly generic (can answer anything).
+ - Gemini formatting heavily restricted (NO markdown, plain text only) for clean Flutter UI.
 """
 
 import os, gc, base64, traceback
@@ -98,7 +78,7 @@ class ExpertBlock(nn.Module):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv2d(ch,ch,3,padding=1,groups=ch), nn.BatchNorm2d(ch), nn.ReLU(True),
-            nn.Conv2d(ch,ch,1),                      nn.BatchNorm2d(ch), nn.ReLU(True))
+            nn.Conv2d(ch,ch,1),                     nn.BatchNorm2d(ch), nn.ReLU(True))
     def forward(self, x): return self.conv(x)
 
 
@@ -433,33 +413,59 @@ def cv_abnormality(img_bgr):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 10. GRAD-CAM  (Upgraded with Red/Jet Blending)
+# 10. GRAD-CAM (IMPORTED FROM USER SCRIPT)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class GradCAM:
-    def __init__(self, model, layer):
-        self.model = model; self.acts = None; self.grads = None
-        self._h = [
-            layer.register_forward_hook(lambda m,i,o: setattr(self,'acts',o.detach())),
-            layer.register_full_backward_hook(lambda m,gi,go: setattr(self,'grads',go[0].detach())),
-        ]
-
-    def remove(self): [h.remove() for h in self._h]
-
-    def __call__(self, sp, fr, cls_idx=0):
-        try:
-            self.model.eval()
-            logits, _ = self.model(sp, fr)
-            self.model.zero_grad()
-            logits[0, cls_idx].backward(retain_graph=True)
-            if self.acts is None or self.grads is None: return None
-            weights = self.grads.cpu().numpy()[0].mean(axis=(1,2))
-            acts    = self.acts.cpu().numpy()[0]
-            cam     = np.maximum((weights[:,None,None] * acts).sum(0), 0)
-            if cam.max() > 0: cam /= cam.max()
-            return cam
-        except Exception as e:
-            print(f"[GradCAM.__call__] {e}"); traceback.print_exc(); return None
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.gradients = None
+        self.activations = None
+        
+        # Register hooks
+        self.fh = self.target_layer.register_forward_hook(self.forward_hook)
+        self.bh = self.target_layer.register_full_backward_hook(self.backward_hook)
+    
+    def forward_hook(self, module, input, output):
+        self.activations = output
+    
+    def backward_hook(self, module, grad_input, grad_output):
+        self.gradients = grad_output[0]
+        
+    def remove(self):
+        """Clean up hooks to prevent memory leaks"""
+        self.fh.remove()
+        self.bh.remove()
+    
+    def generate_heatmap(self, sp, fr, target_class=None):
+        self.model.eval()
+        output, _ = self.model(sp, fr)
+        
+        if target_class is None:
+            target_class = output.argmax(dim=1).item()
+        
+        self.model.zero_grad()
+        one_hot = torch.zeros_like(output)
+        one_hot[0][target_class] = 1
+        output.backward(gradient=one_hot, retain_graph=True)
+        
+        if self.gradients is None or self.activations is None: 
+            return None
+        
+        gradients = self.gradients.detach().cpu().numpy()[0]
+        activations = self.activations.detach().cpu().numpy()[0]
+        
+        weights = np.mean(gradients, axis=(1, 2))
+        heatmap = np.zeros(activations.shape[1:], dtype=np.float32)
+        for i, w in enumerate(weights):
+            heatmap += w * activations[i]
+        
+        heatmap = np.maximum(heatmap, 0)
+        if heatmap.max() > 0:
+            heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
+        
+        return heatmap
 
 
 def get_gradcam_layer(model):
@@ -476,56 +482,35 @@ def get_gradcam_layer(model):
     return best
 
 
-def generate_heatmap_overlay(img_bgr_display, cam, scan_type, style='red'):
-    """
-    Upgraded Visuals: Uses cv2.addWeighted and exact colormap logic
-    from the visual script, while preserving native model hooks.
-    style: 'jet' or 'red'
-    """
+def create_red_heatmap(original_image, heatmap, alpha=0.6):
+    """Imported from user script: Special function for red-only heatmap"""
     try:
-        if cam is None: return None
-
-        # 1. Prepare original image
-        img = img_bgr_display.copy()
-        h_d, w_d = img.shape[:2]
-
-        # 2. Resize and normalize CAM
-        cam_rs = cv2.resize(cam, (w_d, h_d), interpolation=cv2.INTER_CUBIC)
-        cam_rs = np.clip(cam_rs, 0, None)
-        if cam_rs.max() > 0: cam_rs /= cam_rs.max()
-
-        # 3. Smooth the heatmap
-        ksz = max(11, int(min(h_d, w_d) * 0.04) | 1)
-        cam_rs = cv2.GaussianBlur(cam_rs, (ksz, ksz), 0)
-        if cam_rs.max() > 0: cam_rs /= cam_rs.max()
-
-        # 4. Mask out mammogram background (keep background black)
-        if 'mammogram' in scan_type:
-            tissue = (get_tissue_mask(img) > 0).astype(np.float32)
-            cam_rs = cam_rs * tissue
-
-        # 5. Apply Colormaps
-        heatmap_enhanced = np.uint8(255 * cam_rs)
-
-        if style == 'red':
-            # Pure Red Channel (Medical-friendly highlight)
-            heatmap_colored = np.zeros_like(img)
-            heatmap_colored[..., 2] = heatmap_enhanced  # Red channel in BGR
-            alpha = 0.6
-        else:
-            # Standard Jet Colormap
-            heatmap_colored = cv2.applyColorMap(heatmap_enhanced, cv2.COLORMAP_JET)
-            alpha = 0.5
-
-        # 6. Smooth Blending
-        overlay = cv2.addWeighted(img, 1 - alpha, heatmap_colored, alpha, 0)
-
-        # 7. Encode for frontend
-        _, buf = cv2.imencode('.jpg', overlay, [cv2.IMWRITE_JPEG_QUALITY, 95])
-        return base64.b64encode(buf).decode()
-
+        heatmap_resized = cv2.resize(heatmap, (original_image.shape[1], original_image.shape[0]))
+        red_heatmap = np.zeros_like(original_image)
+        red_heatmap[..., 0] = 0
+        red_heatmap[..., 1] = 0
+        red_heatmap[..., 2] = np.uint8(255 * heatmap_resized)  # Red channel
+        
+        superimposed = cv2.addWeighted(original_image, 1 - alpha, red_heatmap, alpha, 0)
+        return superimposed
+        
     except Exception as e:
-        print(f"[Heatmap] {e}"); traceback.print_exc(); return None
+        print(f"❌ Error creating red heatmap: {str(e)}")
+        return original_image
+
+def apply_heatmap_jet(original_image, heatmap, alpha=0.5):
+    """Imported from user script: Standard Jet Colormap implementation"""
+    try:
+        heatmap_resized = cv2.resize(heatmap, (original_image.shape[1], original_image.shape[0]))
+        heatmap_enhanced = np.uint8(255 * heatmap_resized)
+        
+        heatmap_colored = cv2.applyColorMap(heatmap_enhanced, cv2.COLORMAP_JET)
+        # Note: Do not convert to RGB here because cv2.imencode expects BGR to compress to JPEG correctly.
+        superimposed = cv2.addWeighted(original_image, 1 - alpha, heatmap_colored, alpha, 0)
+        return superimposed
+    except Exception as e:
+        print(f"❌ Error applying heatmap: {str(e)}")
+        return original_image
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -755,7 +740,6 @@ def predict():
             except RuntimeError as e: return jsonify({'error':str(e)}),503
             pm,cm,prm = run_inference(model_m,lbl_m,sp,fr)
 
-            # MEMORY LEAK FIX: Clear the first model before loading the second
             del model_m; gc.collect()
 
             try: model_d,lbl_d = load_model('mammogram_dmid')
@@ -796,7 +780,7 @@ def predict():
              if final_pred=='Benign' else
              "LOW RISK: Continue routine annual screening.")
 
-        # ── 7. GradCAM (Upgraded Blending) ─────────────────────────────────
+        # ── 7. GradCAM (USER PROVIDED CODE) ────────────────────────────────
         hmap_b64=None; ann_b64=None; cam_mask=None
         lesion_d={}; tex_d={}; risk_d={}
 
@@ -805,11 +789,15 @@ def predict():
             try:
                 cls_idx  = wl.index(final_pred) if final_pred in wl else 0
                 gcam     = GradCAM(loaded_model, tgt)
-                cam_mask = gcam(sp, fr, cls_idx)
-                gcam.remove()
+                cam_mask = gcam.generate_heatmap(sp, fr, cls_idx)
+                gcam.remove() # Clean hooks to prevent memory leaks
+                
                 if cam_mask is not None:
-                    # Switch to style='jet' here if you want standard rainbow colors
-                    hmap_b64 = generate_heatmap_overlay(img_display, cam_mask, detected, style='red')
+                    # Switch to apply_heatmap_jet(img_display, cam_mask, alpha=0.5) if you want Jet colors
+                    overlay = create_red_heatmap(img_display, cam_mask, alpha=0.6)
+                    
+                    _, buf = cv2.imencode('.jpg', overlay, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    hmap_b64 = base64.b64encode(buf).decode()
             except Exception as e:
                 print(f"[GradCAM-run] {e}"); traceback.print_exc()
 
@@ -855,41 +843,42 @@ def predict():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 13.5 CHAT ROUTE (BreastScan AI Assistant)
+# 13.5 CHAT ROUTE (Generic AI Assistant with formatting fixes)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.route('/chat', methods=['POST'])
 def chat():
     data = request.json
-    if not data or 'message' not in data or 'report' not in data:
-        return jsonify({'error': 'Missing message or report data.'}), 400
+    if not data or 'message' not in data:
+        return jsonify({'error': 'Missing message data.'}), 400
 
     user_message = data['message']
-    patient_report_json = data['report']
+    patient_report_json = data.get('report', {})
 
     try:
-        # Initialize the client (automatically reads GEMINI_API_KEY from environment)
         client = genai.Client()
 
-        # The System Instruction Prompt: Grounds the LLM in your specific JSON data.
+        # UPDATED PROMPT: Highly generic and strictly restricts Markdown for clean Flutter rendering.
         sys_instruct = f"""
-        You are BreastScan's empathetic, highly intelligent AI medical assistant.
-        The user has just received a multi-modality deep learning scan result.
-        Here is the raw data of their scan, including CV analysis, lesion boundaries, and risk scoring:
+        You are BreastScan's intelligent, empathetic AI medical assistant. 
+        You can answer ANY general health, medical, or technical question the user asks. 
+        If the user asks about their specific results or asks you to "review the results", 
+        use this JSON data from their latest scan to explain it to them in simple words:
         {patient_report_json}
 
-        Your job is to answer the user's questions about this specific scan data.
-        Be compassionate, clear, and avoid overly dense jargon.
-        Crucially: Always remind the user that you are an AI decision-support tool and they must consult a human radiologist.
+        CRITICAL FORMATTING RULES (YOU MUST OBEY THESE):
+        1. NO MARKDOWN: You are strictly forbidden from using asterisks (**), hashes (#), or any markdown styling. 
+        2. PLAIN TEXT ONLY: The frontend app cannot render markdown. If you use '**', it will break the UI.
+        3. SPACING: Use clean line breaks (paragraphs) and standard dashes (-) for bullet points.
+        4. SIMPLICITY: Explain medical terms in very simple, layperson language.
+        5. DISCLAIMER: Always gently remind the user at the end to consult a human doctor or radiologist.
         """
 
-        # Configure the AI parameters
         config = types.GenerateContentConfig(
             system_instruction=sys_instruct,
-            temperature=0.3, # Keeps responses grounded and factual
+            temperature=0.3,
         )
 
-        # Generate the response using the fast flash model
         response = client.models.generate_content(
             model='gemini-2.5-flash',
             contents=user_message,
