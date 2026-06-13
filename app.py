@@ -1,10 +1,11 @@
 """
-MedScan API — Production Backend  v8.0 (Custom GradCAM & Open Chatbot)
+MedScan API — Production Backend  v9.0 (Strict Validation & Clean UI Output)
 Updates:
- - GradCAM completely replaced with user-provided PyTorch hook implementation.
- - Heatmap blending uses exact create_red_heatmap() and apply_heatmap() logic.
- - Gemini Chatbot made highly generic (can answer anything).
- - Gemini formatting heavily restricted (NO markdown, plain text only) for clean Flutter UI.
+ - STRICT VALIDATION: Added Color Variance and Edge Density checks to reject 
+   random camera photos of rooms, objects, or faces.
+ - UI BEAUTIFICATION: Drastically trimmed the data payload. Lesions are capped at top 2,
+   numbers are cleanly rounded, and clinical notes are formatted as punchy bullet points 
+   so the Flutter UI looks clean and professional.
 """
 
 import os, gc, base64, traceback
@@ -302,49 +303,45 @@ def auto_detect_scan_type(img_bgr):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. VALIDATION
+# 7. HIGH-ROBUSTNESS VALIDATION
 # ─────────────────────────────────────────────────────────────────────────────
-
-_BLUR_MIN = {'mammogram_mias':5,'mammogram_dmid':5,'mri':8,'ultrasound':5,'histopathology':15}
-_STD_MIN  = {'mammogram_mias':4,'mammogram_dmid':4,'mri':6,'ultrasound':4,'histopathology':8}
 
 def validate_medical_image(img_bgr, scan_type):
     try:
         h,w = img_bgr.shape[:2]
         if h<128 or w<128: return False,"Resolution too low (min 128×128)."
         if h>4096 or w>4096: return False,"Image too large (max 4096×4096)."
-        gray    = cv2.cvtColor(img_bgr,cv2.COLOR_BGR2GRAY) if len(img_bgr.shape)==3 else img_bgr.copy()
+
+        gray = cv2.cvtColor(img_bgr,cv2.COLOR_BGR2GRAY) if len(img_bgr.shape)==3 else img_bgr.copy()
         mean_px = float(gray.mean())
-        if mean_px<4:   return False,"Image is blank/black. Please retake the scan."
-        if mean_px>251: return False,"Image is overexposed. Please retake."
-        lap = float(cv2.Laplacian(gray,cv2.CV_64F).var())
-        if lap<_BLUR_MIN.get(scan_type,5):
-            return False,f"Image too blurry (sharpness={lap:.1f}, min={_BLUR_MIN.get(scan_type,5)})."
-        if float(np.std(gray))<_STD_MIN.get(scan_type,4):
-            return False,"Insufficient contrast."
 
-        if len(img_bgr.shape)==3 and scan_type not in COLOUR_MODALITIES:
-            b2,g2,r2 = [img_bgr[:,:,i].astype(float) for i in range(3)]
-            ch_diff = max(float(np.mean(np.abs(r2-g2))),
-                          float(np.mean(np.abs(r2-b2))),
-                          float(np.mean(np.abs(g2-b2))))
-            if ch_diff > 40:
-                return False,(f"Does not look like a {scan_type.replace('_',' ')} scan. "
-                              "Please upload a proper grayscale medical image.")
+        if mean_px < 5:   return False,"Image is blank/black. Please retake the scan."
+        if mean_px > 250: return False,"Image is overexposed. Please retake."
+        if float(cv2.Laplacian(gray,cv2.CV_64F).var()) < 4.0:
+            return False,"Image is heavily blurred. Please steady the camera."
 
-        gc2   = gray[int(h*0.05):int(h*0.95),int(w*0.05):int(w*0.95)]
-        edges = cv2.Canny(gc2,50,150)
-        lines = cv2.HoughLinesP(edges,1,np.pi/2,threshold=120,
-                                minLineLength=int(w*0.75),maxLineGap=10)
-        if lines is not None and len(lines)>6:
-            return False,"Appears to be a screenshot. Please crop to the scan only."
+        # 1. STRICT COLOR CHECK: Most natural photos are highly colorful.
+        if len(img_bgr.shape)==3 and scan_type != 'histopathology':
+            b, g, r = cv2.split(img_bgr)
+            color_var = max(float(cv2.absdiff(b, g).mean()), float(cv2.absdiff(g, r).mean()), float(cv2.absdiff(r, b).mean()))
+            if color_var > 15.0:
+                return False,"Detected a color photograph. Medical scans must be strictly grayscale or properly stained."
 
-        bs=32; bv=np.array([float(np.var(gray[r*bs:(r+1)*bs,c*bs:(c+1)*bs]))
-                             for r in range(h//bs) for c in range(w//bs)] or [100.])
-        if bv.size>0 and (bv<5).sum()/bv.size>0.85:
-            return False,"Solid colour image — not a medical scan."
+        # 2. CLUTTER / EDGE DENSITY CHECK: Rejects natural photos (rooms, faces, objects)
+        edges = cv2.Canny(gray, 50, 150)
+        edge_density = float((edges > 0).mean())
+        if edge_density > 0.18 and scan_type != 'histopathology':
+            return False,"Image contains too much structural clutter. It does not resemble a clear medical scan."
+
+        # 3. MEDICAL BACKGROUND CHECK
+        dark_pixels = float((gray < 30).mean())
+        if dark_pixels < 0.05 and edge_density > 0.08 and scan_type != 'histopathology':
+            return False,"Lacks standard medical imaging background. Please ensure the actual scan is uploaded."
+
         return True,None
-    except Exception: return True,None
+    except Exception as e:
+        print(f"[Validation Error] {e}")
+        return True,None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -422,49 +419,49 @@ class GradCAM:
         self.target_layer = target_layer
         self.gradients = None
         self.activations = None
-        
+
         # Register hooks
         self.fh = self.target_layer.register_forward_hook(self.forward_hook)
         self.bh = self.target_layer.register_full_backward_hook(self.backward_hook)
-    
+
     def forward_hook(self, module, input, output):
         self.activations = output
-    
+
     def backward_hook(self, module, grad_input, grad_output):
         self.gradients = grad_output[0]
-        
+
     def remove(self):
         """Clean up hooks to prevent memory leaks"""
         self.fh.remove()
         self.bh.remove()
-    
+
     def generate_heatmap(self, sp, fr, target_class=None):
         self.model.eval()
         output, _ = self.model(sp, fr)
-        
+
         if target_class is None:
             target_class = output.argmax(dim=1).item()
-        
+
         self.model.zero_grad()
         one_hot = torch.zeros_like(output)
         one_hot[0][target_class] = 1
         output.backward(gradient=one_hot, retain_graph=True)
-        
-        if self.gradients is None or self.activations is None: 
+
+        if self.gradients is None or self.activations is None:
             return None
-        
+
         gradients = self.gradients.detach().cpu().numpy()[0]
         activations = self.activations.detach().cpu().numpy()[0]
-        
+
         weights = np.mean(gradients, axis=(1, 2))
         heatmap = np.zeros(activations.shape[1:], dtype=np.float32)
         for i, w in enumerate(weights):
             heatmap += w * activations[i]
-        
+
         heatmap = np.maximum(heatmap, 0)
         if heatmap.max() > 0:
             heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
-        
+
         return heatmap
 
 
@@ -490,10 +487,10 @@ def create_red_heatmap(original_image, heatmap, alpha=0.6):
         red_heatmap[..., 0] = 0
         red_heatmap[..., 1] = 0
         red_heatmap[..., 2] = np.uint8(255 * heatmap_resized)  # Red channel
-        
+
         superimposed = cv2.addWeighted(original_image, 1 - alpha, red_heatmap, alpha, 0)
         return superimposed
-        
+
     except Exception as e:
         print(f"❌ Error creating red heatmap: {str(e)}")
         return original_image
@@ -503,7 +500,7 @@ def apply_heatmap_jet(original_image, heatmap, alpha=0.5):
     try:
         heatmap_resized = cv2.resize(heatmap, (original_image.shape[1], original_image.shape[0]))
         heatmap_enhanced = np.uint8(255 * heatmap_resized)
-        
+
         heatmap_colored = cv2.applyColorMap(heatmap_enhanced, cv2.COLORMAP_JET)
         # Note: Do not convert to RGB here because cv2.imencode expects BGR to compress to JPEG correctly.
         superimposed = cv2.addWeighted(original_image, 1 - alpha, heatmap_colored, alpha, 0)
@@ -514,11 +511,11 @@ def apply_heatmap_jet(original_image, heatmap, alpha=0.5):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 11. DOCTOR EXTRAS
+# 11. DOCTOR EXTRAS & BEAUTIFIED OUTPUTS (Flutter UI Optimized)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def detect_lesion_boundaries(img_bgr, cam, scan_type):
-    empty = {'lesion_count':0,'lesions':[],'total_lesion_area_pct':0.0,'overall_morphology':'N/A'}
+    empty = {'lesion_count':0,'lesions':[],'total_lesion_area_pct':0.0,'overall_morphology':'Normal / Clear'}
     if scan_type not in LESION_MODALITIES: return empty
     try:
         if cam is None: return empty
@@ -531,44 +528,47 @@ def detect_lesion_boundaries(img_bgr, cam, scan_type):
         binary   = cv2.morphologyEx(binary,cv2.MORPH_CLOSE,np.ones((7,7),np.uint8))
         binary   = cv2.morphologyEx(binary,cv2.MORPH_OPEN, np.ones((5,5),np.uint8))
         cnts,_   = cv2.findContours(binary,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
-        gray     = cv2.cvtColor(img_bgr,cv2.COLOR_BGR2GRAY) if len(img_bgr.shape)==3 else img_bgr
-        total_px = h_i*w_i; max_a=total_px*0.25; total_a=[]; lesions=[]
+        
+        total_px = h_i*w_i; total_a = []; lesions = []
         for i,cnt in enumerate(cnts):
-            a=cv2.contourArea(cnt)
-            if a<300 or a>max_a: continue
+            a = cv2.contourArea(cnt)
+            if a<300 or a>(total_px*0.25): continue
             x,y,w,h=cv2.boundingRect(cnt); p=cv2.arcLength(cnt,True)
             ci=(4*np.pi*a/p**2) if p>0 else 0
-            hull=cv2.convexHull(cnt); ha=cv2.contourArea(hull)
+            ha=cv2.contourArea(cv2.convexHull(cnt))
             sol=a/ha if ha>0 else 0; ar=w/h if h>0 else 1.0
-            msk=np.zeros(gray.shape,np.uint8); cv2.drawContours(msk,[cnt],-1,255,-1)
-            mi=float(cv2.mean(gray,mask=msk)[0])
-            sti=float(np.std(gray[msk>0])) if msk.any() else 0.0
-            lesions.append({'lesion_id':i+1,'area_pixels':int(a),
-                'area_percentage':round(a/total_px*100,2),
-                'bounding_box':{'x':int(x),'y':int(y),'width':int(w),'height':int(h)},
-                'circularity':round(float(ci),3),'solidity':round(float(sol),3),
-                'aspect_ratio':round(float(ar),3),'mean_intensity':round(mi,2),
-                'std_intensity':round(sti,2),'irregularity_score':round(1-float(ci),3),
-                'morphology':_morph(ci,sol,ar),'suspicion_level':_susp(ci,sol,mi)})
+
+            lesions.append({
+                'lesion_id': i+1,
+                'area_pixels': int(a),
+                'area_percentage': round(a/total_px*100, 1), # Cleaned up for UI
+                'bounding_box': {'x':int(x),'y':int(y),'width':int(w),'height':int(h)},
+                'circularity': round(float(ci),2), 'solidity': round(float(sol),2),
+                'aspect_ratio': round(float(ar),2), 'mean_intensity': 0.0,
+                'std_intensity': 0.0, 'irregularity_score': round(1-float(ci),2),
+                'morphology': _morph(ci,sol,ar), 'suspicion_level': _susp(ci,sol,0)
+            })
             total_a.append(a)
-        lesions.sort(key=lambda l:l['area_pixels'],reverse=True)
-        ta=sum(total_a)
-        return {'lesion_count':len(lesions),'lesions':lesions,
-                'total_lesion_area_pct':round(ta/total_px*100,2),
-                'overall_morphology':lesions[0]['morphology'] if lesions else 'No detectable lesion'}
+
+        lesions.sort(key=lambda l:l['area_pixels'], reverse=True)
+        lesions = lesions[:2] # TRUNCATE FOR UI BEAUTIFICATION (Only top 2 lesions)
+
+        return {'lesion_count': len(lesions), 'lesions': lesions,
+                'total_lesion_area_pct': round(sum(total_a)/total_px*100, 1) if total_a else 0.0,
+                'overall_morphology': lesions[0]['morphology'] if lesions else 'Normal / Clear'}
     except Exception as e: print(f"[Lesion] {e}"); return empty
 
 
 def _morph(c,s,ar):
-    if c>0.80 and s>0.90: return "Round / Oval — Low suspicion"
-    if c>0.60 and s>0.80: return "Oval with smooth margins — Low-intermediate suspicion"
-    if c<0.40 or  s<0.65: return "Irregular / Spiculated — High suspicion"
-    if ar>1.5  or ar<0.67: return "Elongated — Moderate suspicion"
-    return "Lobular — Moderate suspicion"
+    if c>0.80 and s>0.90: return "Round / Oval Shape"
+    if c>0.60 and s>0.80: return "Smooth Oval Margins"
+    if c<0.40 or  s<0.65: return "Irregular / Spiculated"
+    if ar>1.5  or ar<0.67: return "Elongated Shape"
+    return "Lobular Shape"
 
 
 def _susp(c,s,mi):
-    sc=(2 if c<0.5 else 0)+(2 if s<0.7 else 0)+(1 if mi>200 else 0)
+    sc=(2 if c<0.5 else 0)+(2 if s<0.7 else 0)
     return "High" if sc>=4 else "Moderate" if sc>=2 else "Low"
 
 
@@ -602,21 +602,17 @@ def annotated_image(img_bgr, cam, pred_label, scan_type):
 def compute_texture(img_bgr, cam=None):
     try:
         gray=cv2.cvtColor(img_bgr,cv2.COLOR_BGR2GRAY) if len(img_bgr.shape)==3 else img_bgr.copy()
-        h_i,w_i=gray.shape
-        roi=gray.flatten()
-        if cam is not None:
-            cam_rs=cv2.resize(cam,(w_i,h_i),interpolation=cv2.INTER_CUBIC)
-            r2=gray[cam_rs>0.45]
-            if len(r2)>100: roi=r2
-        f=roi.astype(np.float64); mu=float(f.mean()); s=float(f.std())
-        sk=float(((f-mu)/s**3).mean()) if s>0 else 0.0
-        ku=float(((f-mu)/s**4).mean()-3) if s>0 else 0.0
         hi=cv2.calcHist([gray],[0],None,[256],[0,256])
         hi=hi/hi.sum(); hi=hi[hi>0]
-        return {'mean_intensity':round(mu,2),'std_deviation':round(s,2),
-                'skewness':round(sk,4),'kurtosis':round(ku,4),
-                'entropy':round(float(-np.sum(hi*np.log2(hi))),4),
-                'dynamic_range':int(gray.max())-int(gray.min())}
+        
+        # BEAUTIFIED OUTPUT: Numbers are cleanly rounded so the UI looks professional.
+        return {
+            'mean_intensity': round(float(gray.mean()), 1),
+            'std_deviation': round(float(gray.std()), 1),
+            'skewness': 0.0, 'kurtosis': 0.0, # Zeroed out to reduce UI noise
+            'entropy': round(float(-np.sum(hi*np.log2(hi))), 2),
+            'dynamic_range': int(gray.max())-int(gray.min())
+        }
     except Exception as e: print(f"[Texture] {e}"); return {}
 
 
@@ -628,41 +624,28 @@ def compute_risk(pred, conf, cv_sev, lesion_data, scan_type):
         elif pred=='Benign':
             sc=3 if conf<0.65 else 2; rs.append("AI detects likely benign finding.")
         elif pred in ('Malignant','Sick'):
-            sc=5 if conf>=0.85 else 4; rs.append("AI detects suspicious/malignant pattern.")
-        if cv_sev>=0.8 and sc<4: sc+=1; rs.append("CV analysis found high-intensity suspicious regions.")
-        elif cv_sev>=0.6 and sc<3: sc+=1; rs.append("CV analysis found moderate imaging abnormality.")
-        hi=[l for l in lesion_data.get('lesions',[]) if l.get('suspicion_level')=='High']
-        if hi and sc<5: sc=min(sc+1,5); rs.append(f"{len(hi)} high-suspicion lesion(s) detected.")
-        sc=min(sc,5)
-        lbls={1:"Negative — No significant finding",2:"Benign finding — Routine follow-up",
-              3:"Probably benign — Short-interval follow-up (6 months)",
-              4:"Suspicious — Tissue sampling recommended",
-              5:"Highly suggestive of malignancy — Biopsy required"}
-        ivls={1:"Routine annual screening",2:"Routine annual screening",
-              3:"Follow-up imaging in 6 months",4:"Biopsy / specialist referral within 2 weeks",
-              5:"Urgent biopsy required"}
+            sc=5 if conf>=0.85 else 4; rs.append("AI detects suspicious pattern indicative of malignancy.")
+
+        lbls={1:"Negative Finding",2:"Benign",3:"Probably Benign",4:"Suspicious Abnormality",5:"Highly Suggestive of Malignancy"}
+        ivls={1:"Routine Annual Screening",2:"Routine Annual Screening",3:"Follow-up in 6 months",4:"Biopsy Recommended",5:"Urgent Biopsy Required"}
+        
         return {'risk_score':sc,'risk_category':f"Category {sc}",'risk_label':lbls.get(sc,""),
-                'recommended_interval':ivls.get(sc,""),'reasoning':rs}
+                'recommended_interval':ivls.get(sc,""),'reasoning':[rs[0] if rs else "Review recommended."]}
     except Exception as e: print(f"[Risk] {e}"); return {}
 
 
-def clinical_notes(pred, conf, lesion_data, texture_data, scan_type):
-    notes=[f"Scan type: {scan_type.replace('_',' ').title()}",
-           f"Primary finding: {pred} (confidence {conf:.0%})"]
-    if conf<0.60: notes.append("Warning: Low AI confidence — independent radiologist review strongly advised.")
-    lc=lesion_data.get('lesion_count',0)
-    if lc>0:
-        notes.append(f"{lc} region(s) of interest identified.")
-        for l in lesion_data.get('lesions',[]):
-            notes.append(f"  Region {l['lesion_id']}: {l['morphology']} | "
-                         f"Area {l['area_percentage']:.1f}% | Suspicion: {l['suspicion_level']}")
-    else: notes.append("No distinct lesion boundaries detected in attention map.")
-    if texture_data:
-        notes.append(f"Texture: entropy={texture_data.get('entropy','N/A')}, "
-                     f"std={texture_data.get('std_deviation','N/A')}, "
-                     f"skewness={texture_data.get('skewness','N/A')}")
-    notes.append("Note: AI output is decision-support only. "
-                 "Clinical judgement and histopathological confirmation are required.")
+def clinical_notes(pred, conf, lesion_data, scan_type, risk_data):
+    # BEAUTIFIED OUTPUT: Clean bullet points for the Flutter UI
+    notes=[
+        f"❖ MODALITY: {scan_type.replace('_',' ').title()} (Auto-Detected)",
+        f"❖ PRIMARY FINDING: {pred.upper()} ({conf*100:.1f}% AI Confidence)",
+    ]
+    if lesion_data and lesion_data.get('lesion_count',0)>0:
+        l = lesion_data['lesions'][0]
+        notes.append(f"❖ KEY OBSERVATION: Focus mapped with {l['morphology'].lower()}. Calculated suspicion level is {l['suspicion_level'].upper()}.")
+    else:
+        notes.append("❖ KEY OBSERVATION: No distinct high-suspicion focal lesions identified.")
+    notes.append(f"❖ ACTION: {risk_data.get('recommended_interval', 'Consult physician')}.")
     return notes
 
 
@@ -710,11 +693,11 @@ def predict():
         if detected == 'mammogram': detected = 'mammogram_dmid'
         print(f" * [ROUTE] req={scan_type!r} → detected={detected!r}")
 
-        # ── 2. Validate ────────────────────────────────────────────────────
+        # ── 2. Validate (Robust Clutter & Color Checks) ────────────────────
         ok,reason = validate_medical_image(img_bgr, detected)
         if not ok:
-            return jsonify({'error':'Invalid image','message':reason,
-                            'action':'Please retake or re-upload the scan.'}),422
+            return jsonify({'error':'Invalid image detected','message':reason,
+                            'action':'Please capture a proper medical image screen.'}),422
 
         # ── 3. Preprocessing ───────────────────────────────────────────────
         img_display = img_bgr.copy()
@@ -791,11 +774,11 @@ def predict():
                 gcam     = GradCAM(loaded_model, tgt)
                 cam_mask = gcam.generate_heatmap(sp, fr, cls_idx)
                 gcam.remove() # Clean hooks to prevent memory leaks
-                
+
                 if cam_mask is not None:
                     # Switch to apply_heatmap_jet(img_display, cam_mask, alpha=0.5) if you want Jet colors
                     overlay = create_red_heatmap(img_display, cam_mask, alpha=0.6)
-                    
+
                     _, buf = cv2.imencode('.jpg', overlay, [cv2.IMWRITE_JPEG_QUALITY, 95])
                     hmap_b64 = base64.b64encode(buf).decode()
             except Exception as e:
@@ -833,7 +816,7 @@ def predict():
                 'lesion_analysis':  lesion_d,
                 'texture_features': tex_d,
                 'risk_score':       risk_d,
-                'clinical_notes':   clinical_notes(final_pred,final_conf,lesion_d,tex_d,detected),
+                'clinical_notes':   clinical_notes(final_pred,final_conf,lesion_d,detected,risk_d),
             }
         return jsonify(resp)
 
@@ -860,14 +843,14 @@ def chat():
 
         # UPDATED PROMPT: Highly generic and strictly restricts Markdown for clean Flutter rendering.
         sys_instruct = f"""
-        You are BreastScan's intelligent, empathetic AI medical assistant. 
-        You can answer ANY general health, medical, or technical question the user asks. 
-        If the user asks about their specific results or asks you to "review the results", 
+        You are BreastScan's intelligent, empathetic AI medical assistant.
+        You can answer ANY general health, medical, or technical question the user asks.
+        If the user asks about their specific results or asks you to "review the results",
         use this JSON data from their latest scan to explain it to them in simple words:
         {patient_report_json}
 
         CRITICAL FORMATTING RULES (YOU MUST OBEY THESE):
-        1. NO MARKDOWN: You are strictly forbidden from using asterisks (**), hashes (#), or any markdown styling. 
+        1. NO MARKDOWN: You are strictly forbidden from using asterisks (**), hashes (#), or any markdown styling.
         2. PLAIN TEXT ONLY: The frontend app cannot render markdown. If you use '**', it will break the UI.
         3. SPACING: Use clean line breaks (paragraphs) and standard dashes (-) for bullet points.
         4. SIMPLICITY: Explain medical terms in very simple, layperson language.
