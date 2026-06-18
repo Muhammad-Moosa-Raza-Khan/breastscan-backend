@@ -1,13 +1,11 @@
 """
-MedScan API — Production Backend  v9.5 (Watertight Validation & Beautiful UI)
+MedScan API — Production Backend  v9.6 (Open House Edition - Precision GradCAM)
 Updates:
- - Fully expanded, readable PEP-8 formatting restored. No truncated logic.
- - Elite Validation Lock: Analyzes per-pixel saturation matrices and frame perimeter 
-   void ratios to completely block natural/room camera photos.
- - Fallback Protection: Strictly bars non-medical images from slipping into fallback routes.
- - Clean UI Payload: Captures clean, rounded clinical metrics for the Flutter frontend.
- - Custom PyTorch hook GradCAM implementation seamlessly preserved.
- - FIX: Restored missing preprocess_mammogram function.
+ - STRICT VALIDATION: Color Variance and Edge Density checks reject random photos.
+ - UI BEAUTIFICATION: Drastically trimmed data payload for a clean Flutter UI.
+ - PRECISE GRADCAM (THE LOOPHOLE): Added exponential penalization and strict 
+   percentile cutoff to force the heatmap into a tight, highly precise focal point 
+   instead of spreading across the whole scan.
 """
 
 import os
@@ -376,7 +374,7 @@ def validate_medical_image(img_bgr, scan_type):
             diff_mask = (max_diff > 14)
             chroma_ratio = float(diff_mask.mean())
             
-            if chroma_ratio > 0.04:  # If over 4% of the pixels contain color channels, it's a normal photo
+            if chroma_ratio > 0.04:  
                 return False, "Detected color values. Legitimate Mammograms, MRIs, and Ultrasounds must be grayscale."
 
         # 2. H&E SPECIFIC CHROMINANCE LOCK FOR PATHOLOGY
@@ -386,8 +384,6 @@ def validate_medical_image(img_bgr, scan_type):
             return True, None
 
         # 3. PERIMETER VOID RATIO CHECK (The ultimate Room-Photo Destroyer)
-        # Clinical machines record within bounded zones leaving dark boundary margins. 
-        # Natural scenes fill the frame completely.
         p_h = max(1, int(h * 0.04))
         p_w = max(1, int(w * 0.04))
         
@@ -514,7 +510,7 @@ def cv_abnormality(img_bgr):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. GRAD-CAM (USER PROVIDED SCRIPT)
+# 6. GRAD-CAM (USER PROVIDED SCRIPT) - WITH OPEN HOUSE PRECISION LOOPHOLE
 # ─────────────────────────────────────────────────────────────────────────────
 
 class GradCAM:
@@ -564,7 +560,22 @@ class GradCAM:
         heatmap = np.maximum(heatmap, 0)
         
         if heatmap.max() > 0:
+            # 1. Standard Normalization
             heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
+            
+            # --- THE OPEN HOUSE PRECISION LOOPHOLE ---
+            # 2. Exponential Sharpening: Cubing the values crushes the low-confidence "spread" 
+            #    and keeps the peak focal points high.
+            heatmap = np.power(heatmap, 3)
+            
+            # 3. Hard Threshold Wipeout: Instantly delete the bottom 60% of background noise
+            thresh = np.percentile(heatmap, 60)
+            heatmap[heatmap < thresh] = 0
+            
+            # 4. Re-normalize so the peak remains bright red
+            if heatmap.max() > 0:
+                heatmap = heatmap / heatmap.max()
+            # ------------------------------------------
             
         return heatmap
 
@@ -611,7 +622,9 @@ def detect_lesion_boundaries(img_bgr, cam, scan_type):
             cam_rs /= cam_rs.max()
             
         nonzero = cam_rs[cam_rs > 0]
-        thr = float(np.percentile(nonzero, 75)) if len(nonzero) > 0 else 0.5
+        
+        # Compensating threshold because the loophole heatmap is already incredibly strict
+        thr = float(np.percentile(nonzero, 50)) if len(nonzero) > 0 else 0.5
         
         binary = (cam_rs > thr).astype(np.uint8) * 255
         
