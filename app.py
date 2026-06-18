@@ -7,6 +7,7 @@ Updates:
  - Fallback Protection: Strictly bars non-medical images from slipping into fallback routes.
  - Clean UI Payload: Captures clean, rounded clinical metrics for the Flutter frontend.
  - Custom PyTorch hook GradCAM implementation seamlessly preserved.
+ - FIX: Restored missing preprocess_mammogram function.
 """
 
 import os
@@ -412,6 +413,18 @@ def validate_medical_image(img_bgr, scan_type):
         print(f"[Shield Warning] {e}")
         return True, None
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. MAMMOGRAM PREPROCESSING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def preprocess_mammogram(img_bgr):
+    try:
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY) if len(img_bgr.shape) == 3 else img_bgr.copy()
+        enh  = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray)
+        den  = cv2.bilateralFilter(enh, 9, 75, 75)
+        return cv2.cvtColor(den, cv2.COLOR_GRAY2BGR)
+    except Exception: 
+        return img_bgr
 
 def crop_to_breast_tissue(img_bgr):
     try:
